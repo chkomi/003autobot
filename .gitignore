@@ -1,0 +1,61 @@
+# Secrets - NEVER commit
+.env
+*.pem
+*.key
+
+# Generated data
+logs/
+data_cache/
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+*.log
+*.csv
+*.tmp
+*.bak
+
+# Python caches
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+
+# Backtest outputs
+backtest/results/
+report/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Distribution
+dist/
+build/
+*.egg-info/
+
+# Local documents
+*.docx

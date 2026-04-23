@@ -1,0 +1,33 @@
+# ============================================================
+# OKX BTC/USDT 자동매매봇 dependencies
+# ============================================================
+
+# Exchange connectivity
+ccxt==4.4.57
+
+# Data processing
+pandas>=2.2.0
+numpy>=2.0.0
+# pandas-ta: Python 3.14에서 numba 의존성 문제로 사용 안 함
+# 지표는 strategy/indicators.py에 pandas/numpy로 직접 구현됨
+
+# Database (async SQLite)
+aiosqlite==0.20.0
+
+# Config & validation
+pydantic==2.10.6
+pydantic-settings==2.7.1
+
+# Logging
+loguru==0.7.3
+
+# Testing
+pytest==8.3.5
+pytest-asyncio==0.24.0
+pytest-mock==3.14.0
+
+# Backtesting (Python 3.14에서 numba 의존성으로 설치 불가. 클라우드/Python 3.11 환경에서 사용)
+# backtesting==0.3.3
+
+# Already installed (listed for completeness):
+# aiohttp, websockets, python-dotenv, fastapi, uvicorn, pydantic, requests, PyYAML, uvloop

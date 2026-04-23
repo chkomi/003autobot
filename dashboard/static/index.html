@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OKX 자동매매봇 — 시그널 대시보드</title>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--dim:#8b949e;--green:#3fb950;--red:#f85149;--blue:#58a6ff;--orange:#d29922;--purple:#bc8cff}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);overflow-x:hidden}
+.header{background:var(--card);border-bottom:1px solid var(--border);padding:10px 20px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.header h1{font-size:16px;font-weight:600;white-space:nowrap}
+.badge{padding:3px 10px;border-radius:10px;font-size:11px;font-weight:700}
+.badge-bull{background:#238636;color:#fff}.badge-bear{background:#da3633;color:#fff}.badge-neutral{background:#6e7681;color:#fff}
+.badge-watching{background:#238636;color:#fff}.badge-in_trade{background:#1f6feb;color:#fff}.badge-halted{background:#da3633;color:#fff}
+.price-tag{font-size:20px;font-weight:700;margin-left:auto}
+.balance-tag{font-size:13px;color:var(--dim)}
+.halt-btn{background:#da3633;border:none;color:#fff;padding:6px 16px;border-radius:6px;cursor:pointer;font-size:12px}
+.halt-btn:hover{background:#f85149}
+.main{padding:12px}
+.chart-row{display:flex;gap:0;margin-bottom:2px}
+.chart-box{background:var(--card);border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.chart-box.full{width:100%}
+.sub-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:2px;margin-bottom:12px}
+.sub-row .chart-box{min-height:140px}
+.chart-label{font-size:10px;color:var(--dim);padding:4px 8px;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--border)}
+.layers{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:12px}
+.layer-card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px}
+.layer-title{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;display:flex;align-items:center;gap:6px}
+.layer-status{font-size:18px;font-weight:700;margin-bottom:6px}
+.layer-detail{font-size:12px;color:var(--dim);line-height:1.6}
+.layer-detail b{color:var(--text)}
+.signal-panel{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:12px}
+.signal-title{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px}
+.prob-row{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.prob-label{width:50px;font-size:13px;font-weight:700}
+.prob-bar-bg{flex:1;height:22px;background:#21262d;border-radius:4px;overflow:hidden;position:relative}
+.prob-bar{height:100%;border-radius:4px;transition:width .5s ease}
+.prob-bar.long{background:linear-gradient(90deg,#238636,#3fb950)}
+.prob-bar.short{background:linear-gradient(90deg,#da3633,#f85149)}
+.prob-pct{width:45px;text-align:right;font-size:14px;font-weight:700}
+.score-bars{display:flex;gap:6px;margin-top:12px;align-items:flex-end;height:60px}
+.score-col{flex:1;display:flex;flex-direction:column;align-items:center;gap:2px}
+.score-fill{width:100%;border-radius:3px 3px 0 0;transition:height .5s ease}
+.score-lbl{font-size:9px;color:var(--dim);text-align:center}
+.score-val{font-size:10px;font-weight:600}
+.total-score{font-size:28px;font-weight:800;text-align:center;margin:8px 0}
+.trades-section{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px}
+.trades-section h3{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;font-size:11px;color:var(--dim);padding:6px 8px;border-bottom:1px solid var(--border)}
+td{font-size:12px;padding:6px 8px;border-bottom:1px solid #21262d}
+.long-tag{color:var(--green);font-weight:600}.short-tag{color:var(--red);font-weight:600}
+.pos{color:var(--green)}.neg{color:var(--red)}
+@media(max-width:768px){.sub-row,.layers{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>OKX 자동매매봇</h1>
+  <span id="bot-state" class="badge badge-neutral">--</span>
+  <span id="regime-badge" class="badge badge-neutral">--</span>
+  <span id="signal-badge" class="badge badge-neutral">FLAT</span>
+  <span class="price-tag" id="btc-price">$--</span>
+  <span class="balance-tag" id="balance">잔고: --</span>
+  <button class="halt-btn" onclick="haltBot()">긴급 정지</button>
+</div>
+
+<div class="main">
+  <!-- 메인 캔들 차트 -->
+  <div class="chart-row" style="margin-bottom:2px">
+    <div class="chart-box full">
+      <div class="chart-label">BTC/USDT 1H — EMA 21/55/200 + Supertrend + Bollinger Bands</div>
+      <div id="main-chart" style="height:360px"></div>
+    </div>
+  </div>
+
+  <!-- 서브 차트: MACD / RSI / Volume -->
+  <div class="sub-row">
+    <div class="chart-box">
+      <div class="chart-label">MACD (12,26,9)</div>
+      <div id="macd-chart" style="height:130px"></div>
+    </div>
+    <div class="chart-box">
+      <div class="chart-label">RSI (14)</div>
+      <div id="rsi-chart" style="height:130px"></div>
+    </div>
+    <div class="chart-box">
+      <div class="chart-label">거래량 + SMA(20)</div>
+      <div id="vol-chart" style="height:130px"></div>
+    </div>
+  </div>
+
+  <!-- 레이어 상태 카드 -->
+  <div class="layers">
+    <div class="layer-card" id="layer1-card">
+      <div class="layer-title">📊 Layer 1 — 추세 필터 (4H)</div>
+      <div class="layer-status" id="l1-status">--</div>
+      <div class="layer-detail" id="l1-detail">로딩 중...</div>
+    </div>
+    <div class="layer-card" id="layer2-card">
+      <div class="layer-title">⚡ Layer 2 — 모멘텀 트리거 (1H)</div>
+      <div class="layer-status" id="l2-status">--</div>
+      <div class="layer-detail" id="l2-detail">로딩 중...</div>
+    </div>
+    <div class="layer-card" id="layer3-card">
+      <div class="layer-title">🔬 Layer 3 — 미시 확인 (15M)</div>
+      <div class="layer-status" id="l3-status">--</div>
+      <div class="layer-detail" id="l3-detail">로딩 중...</div>
+    </div>
+  </div>
+
+  <!-- 시그널 확률 + 스코어 -->
+  <div class="signal-panel">
+    <div class="signal-title">시그널 확률 및 스코어</div>
+    <div style="display:flex;gap:20px;align-items:center">
+      <div style="flex:1">
+        <div class="prob-row">
+          <span class="prob-label long-tag">LONG</span>
+          <div class="prob-bar-bg"><div class="prob-bar long" id="long-bar" style="width:0%"></div></div>
+          <span class="prob-pct" id="long-pct">0%</span>
+        </div>
+        <div class="prob-row">
+          <span class="prob-label short-tag">SHORT</span>
+          <div class="prob-bar-bg"><div class="prob-bar short" id="short-bar" style="width:0%"></div></div>
+          <span class="prob-pct" id="short-pct">0%</span>
+        </div>
+      </div>
+      <div style="width:100px;text-align:center">
+        <div style="font-size:10px;color:var(--dim)">종합 스코어</div>
+        <div class="total-score" id="total-score">--</div>
+        <div style="font-size:10px;color:var(--dim)">/ 100</div>
+      </div>
+    </div>
+    <div class="score-bars" id="score-bars">
+      <div class="score-col"><div class="score-fill" id="sc-trend" style="height:0;background:var(--blue)"></div><div class="score-val" id="sv-trend">0</div><div class="score-lbl">추세</div></div>
+      <div class="score-col"><div class="score-fill" id="sc-mom" style="height:0;background:var(--orange)"></div><div class="score-val" id="sv-mom">0</div><div class="score-lbl">모멘텀</div></div>
+      <div class="score-col"><div class="score-fill" id="sc-vol" style="height:0;background:var(--green)"></div><div class="score-val" id="sv-vol">0</div><div class="score-lbl">거래량</div></div>
+      <div class="score-col"><div class="score-fill" id="sc-vola" style="height:0;background:var(--purple)"></div><div class="score-val" id="sv-vola">0</div><div class="score-lbl">변동성</div></div>
+      <div class="score-col"><div class="score-fill" id="sc-sent" style="height:0;background:var(--red)"></div><div class="score-val" id="sv-sent">0</div><div class="score-lbl">센티먼트</div></div>
+    </div>
+  </div>
+
+  <!-- 최근 거래 -->
+  <div class="trades-section">
+    <h3>최근 거래 기록</h3>
+    <table>
+      <thead><tr><th>방향</th><th>진입가</th><th>청산가</th><th>P&L</th><th>사유</th><th>신뢰도</th></tr></thead>
+      <tbody id="trades-body"><tr><td colspan="6" style="color:var(--dim);text-align:center">거래 없음</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const C = LightweightCharts;
+const DARK = {layout:{background:{color:'#161b22'},textColor:'#8b949e'},grid:{vertLines:{color:'#21262d'},horzLines:{color:'#21262d'}},crosshair:{mode:0},timeScale:{timeVisible:true,secondsVisible:false}};
+
+// ── Main Chart ──
+const mainEl = document.getElementById('main-chart');
+const mainChart = C.createChart(mainEl, {...DARK, height: 360});
+const candleSeries = mainChart.addCandlestickSeries({upColor:'#3fb950',downColor:'#f85149',borderUpColor:'#3fb950',borderDownColor:'#f85149',wickUpColor:'#3fb950',wickDownColor:'#f85149'});
+const ema21Line = mainChart.addLineSeries({color:'#58a6ff',lineWidth:1,title:'EMA21'});
+const ema55Line = mainChart.addLineSeries({color:'#d29922',lineWidth:1,title:'EMA55'});
+const ema200Line = mainChart.addLineSeries({color:'#f85149',lineWidth:2,title:'EMA200'});
+const stLine = mainChart.addLineSeries({color:'#3fb950',lineWidth:2,lineStyle:2,title:'ST'});
+const bbUpper = mainChart.addLineSeries({color:'rgba(139,148,158,0.3)',lineWidth:1});
+const bbLower = mainChart.addLineSeries({color:'rgba(139,148,158,0.3)',lineWidth:1});
+
+// ── MACD Chart ──
+const macdEl = document.getElementById('macd-chart');
+const macdChart = C.createChart(macdEl, {...DARK, height: 130});
+const macdHist = macdChart.addHistogramSeries({priceLineVisible:false,lastValueVisible:false});
+const macdLine = macdChart.addLineSeries({color:'#58a6ff',lineWidth:1,priceLineVisible:false,lastValueVisible:false});
+const macdSig = macdChart.addLineSeries({color:'#d29922',lineWidth:1,priceLineVisible:false,lastValueVisible:false});
+
+// ── RSI Chart ──
+const rsiEl = document.getElementById('rsi-chart');
+const rsiChart = C.createChart(rsiEl, {...DARK, height: 130});
+const rsiLine = rsiChart.addLineSeries({color:'#bc8cff',lineWidth:2,priceLineVisible:false});
+// RSI zones using horizontal lines
+rsiLine.createPriceLine({price:70,color:'rgba(248,81,73,0.4)',lineWidth:1,lineStyle:2,axisLabelVisible:false});
+rsiLine.createPriceLine({price:30,color:'rgba(63,185,80,0.4)',lineWidth:1,lineStyle:2,axisLabelVisible:false});
+rsiLine.createPriceLine({price:50,color:'rgba(139,148,158,0.2)',lineWidth:1,lineStyle:2,axisLabelVisible:false});
+
+// ── Volume Chart ──
+const volEl = document.getElementById('vol-chart');
+const volChart = C.createChart(volEl, {...DARK, height: 130});
+const volHist = volChart.addHistogramSeries({priceLineVisible:false,lastValueVisible:false});
+const volSmaLine = volChart.addLineSeries({color:'#d29922',lineWidth:1,priceLineVisible:false,lastValueVisible:false});
+
+// ── Sync time scales ──
+function syncCharts(src, ...others) {
+  src.timeScale().subscribeVisibleLogicalRangeChange(r => {
+    if(r) others.forEach(c => c.timeScale().setVisibleLogicalRange(r));
+  });
+}
+syncCharts(mainChart, macdChart, rsiChart, volChart);
+
+// ── Resize ──
+function resize() {
+  const w = mainEl.clientWidth;
+  mainChart.applyOptions({width:w});
+  [macdChart,rsiChart,volChart].forEach(c => c.applyOptions({width: document.querySelector('.sub-row .chart-box').clientWidth}));
+}
+window.addEventListener('resize', resize);
+setTimeout(resize, 100);
+
+// ── Data Loading ──
+async function loadCandles() {
+  const r = await fetch('/api/candles?tf=1h&limit=120');
+  const d = await r.json();
+  if(!d.candles?.length) return;
+  candleSeries.setData(d.candles);
+
+  // Volume data with colors
+  const vd = d.candles.map(c => ({time:c.time, value:c.volume, color: c.close >= c.open ? 'rgba(63,185,80,0.4)' : 'rgba(248,81,73,0.4)'}));
+  volHist.setData(vd);
+}
+
+async function loadIndicators() {
+  const r = await fetch('/api/indicators?tf=1h');
+  const d = await r.json();
+  if(d.error) return;
+
+  if(d.ema21) ema21Line.setData(d.ema21);
+  if(d.ema55) ema55Line.setData(d.ema55);
+  if(d.ema200) ema200Line.setData(d.ema200);
+
+  if(d.supertrend) {
+    const stData = d.supertrend.map(s => ({time:s.time, value:s.value, color: s.dir===1?'#3fb950':'#f85149'}));
+    stLine.setData(stData);
+  }
+
+  if(d.bb) {
+    bbUpper.setData(d.bb.map(b => ({time:b.time, value:b.upper})));
+    bbLower.setData(d.bb.map(b => ({time:b.time, value:b.lower})));
+  }
+
+  if(d.macd) {
+    macdHist.setData(d.macd.map(m => ({time:m.time, value:m.hist, color: m.hist>=0?'rgba(63,185,80,0.6)':'rgba(248,81,73,0.6)'})));
+    macdLine.setData(d.macd.map(m => ({time:m.time, value:m.macd})));
+    macdSig.setData(d.macd.map(m => ({time:m.time, value:m.signal})));
+  }
+
+  if(d.rsi) rsiLine.setData(d.rsi);
+  if(d.volume_sma) volSmaLine.setData(d.volume_sma);
+}
+
+async function loadSignalStatus() {
+  const r = await fetch('/api/signal-status');
+  const d = await r.json();
+
+  // Header
+  document.getElementById('btc-price').textContent = d.current_price ? `$${Number(d.current_price).toLocaleString()}` : '$--';
+  document.getElementById('balance').textContent = `잔고: $${(d.balance||0).toFixed(2)}`;
+
+  const stateEl = document.getElementById('bot-state');
+  stateEl.textContent = d.bot_state || 'UNKNOWN';
+  stateEl.className = `badge badge-${(d.bot_state||'').toLowerCase()}`;
+
+  const regimeEl = document.getElementById('regime-badge');
+  regimeEl.textContent = d.regime || 'NEUTRAL';
+  regimeEl.className = `badge badge-${d.regime==='BULL'?'bull':d.regime==='BEAR'?'bear':'neutral'}`;
+
+  const sigEl = document.getElementById('signal-badge');
+  sigEl.textContent = d.signal || 'FLAT';
+  sigEl.className = `badge ${d.signal==='LONG'?'badge-bull':d.signal==='SHORT'?'badge-bear':'badge-neutral'}`;
+
+  // Layer 1
+  const l1 = d.layer1 || {};
+  const l1Icon = l1.regime==='BULL'?'🟢 BULL':l1.regime==='BEAR'?'🔴 BEAR':'⚪ NEUTRAL';
+  document.getElementById('l1-status').innerHTML = l1Icon;
+  document.getElementById('l1-detail').innerHTML =
+    `EMA 정렬: <b>${l1.ema_aligned?'Yes ✓':'No ✗'}</b><br>` +
+    `Supertrend: <b>${l1.supertrend==='UP'?'↑ 상승':'↓ 하락'}</b><br>` +
+    `EMA: <b>$${(l1.ema_fast||0).toLocaleString()}</b> / $${(l1.ema_mid||0).toLocaleString()} / $${(l1.ema_slow||0).toLocaleString()}`;
+  document.getElementById('layer1-card').style.borderColor = l1.status==='PASS'?'#238636':'var(--border)';
+
+  // Layer 2
+  const l2 = d.layer2 || {};
+  const l2Icon = l2.status==='PASS'?'🟢 PASS':'🔴 FAIL';
+  document.getElementById('l2-status').innerHTML = l2Icon;
+  document.getElementById('l2-detail').innerHTML =
+    `MACD 크로스: <b>${l2.macd_cross||'NONE'}</b><br>` +
+    `RSI: <b>${(l2.rsi||0).toFixed(1)}</b> (롱:35~70 / 숏:30~65)<br>` +
+    `히스토그램: <b>${(l2.macd_hist||0).toFixed(1)}</b>`;
+  document.getElementById('layer2-card').style.borderColor = l2.status==='PASS'?'#238636':'var(--border)';
+
+  // Layer 3
+  const l3 = d.layer3 || {};
+  const l3Icon = l3.status==='PASS'?'🟢 PASS':'🔴 FAIL';
+  document.getElementById('l3-status').innerHTML = l3Icon;
+  const bbPctBar = '█'.repeat(Math.round((l3.bb_pct||0)*10)) + '░'.repeat(10-Math.round((l3.bb_pct||0)*10));
+  document.getElementById('l3-detail').innerHTML =
+    `BB 위치: <b>${(l3.bb_pct||0).toFixed(2)}</b> [${bbPctBar}]<br>` +
+    `거래량: <b>${(l3.volume_ratio||0).toFixed(1)}x</b> ${l3.volume_confirmed?'✅':'❌'} (1.2x 이상 필요)<br>` +
+    `반등: <b>${l3.bb_bounce||'NONE'}</b>`;
+  document.getElementById('layer3-card').style.borderColor = l3.status==='PASS'?'#238636':'var(--border)';
+
+  // Probability bars
+  const lp = d.long_probability || 0;
+  const sp = d.short_probability || 0;
+  document.getElementById('long-bar').style.width = lp + '%';
+  document.getElementById('long-pct').textContent = lp + '%';
+  document.getElementById('short-bar').style.width = sp + '%';
+  document.getElementById('short-pct').textContent = sp + '%';
+
+  // Score bars
+  const sc = d.score || {};
+  const cats = [['trend','sc-trend','sv-trend'],['momentum','sc-mom','sv-mom'],['volume','sc-vol','sv-vol'],['volatility','sc-vola','sv-vola'],['sentiment','sc-sent','sv-sent']];
+  cats.forEach(([k,barId,valId]) => {
+    const v = sc[k] || 0;
+    document.getElementById(barId).style.height = Math.max(v * 0.5, 2) + 'px';
+    document.getElementById(valId).textContent = Math.round(v);
+  });
+  const total = sc.total || 0;
+  const tEl = document.getElementById('total-score');
+  tEl.textContent = Math.round(total);
+  tEl.style.color = total >= 75 ? 'var(--green)' : total >= 60 ? 'var(--orange)' : 'var(--red)';
+}
+
+async function loadTrades() {
+  const r = await fetch('/api/trades?limit=10');
+  const d = await r.json();
+  const tbody = document.getElementById('trades-body');
+  if(!d.trades?.length){
+    tbody.innerHTML = '<tr><td colspan="6" style="color:var(--dim);text-align:center">거래 없음</td></tr>';
+    return;
+  }
+  tbody.innerHTML = d.trades.map(t => {
+    const pnl = t.pnl_usdt || 0;
+    const cls = pnl >= 0 ? 'pos' : 'neg';
+    const sign = pnl >= 0 ? '+' : '';
+    return `<tr>
+      <td class="${t.direction==='LONG'?'long-tag':'short-tag'}">${t.direction}</td>
+      <td>$${Number(t.entry_price||0).toLocaleString()}</td>
+      <td>$${Number(t.exit_price||0).toLocaleString()}</td>
+      <td class="${cls}">${sign}${pnl.toFixed(2)}</td>
+      <td>${t.exit_reason||'--'}</td>
+      <td>${t.signal_confidence?(t.signal_confidence*100).toFixed(0)+'%':'--'}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function loadAll() {
+  try {
+    await Promise.all([loadCandles(), loadIndicators(), loadSignalStatus(), loadTrades()]);
+  } catch(e) { console.error('Load error:', e); }
+}
+
+async function haltBot() {
+  if(!confirm('봇을 긴급 정지하시겠습니까?')) return;
+  await fetch('/api/control/halt', {method:'POST'});
+  loadAll();
+}
+
+loadAll();
+// 캔들/인디케이터는 REST 폴링 유지 (대량 데이터)
+setInterval(() => { loadCandles(); loadIndicators(); }, 30000);
+
+// SSE: 시그널/거래/상태 변화를 실시간 수신
+const evtSource = new EventSource('/api/stream');
+evtSource.addEventListener('signal', () => { loadSignalStatus(); });
+evtSource.addEventListener('trade', () => { loadTrades(); loadSignalStatus(); });
+evtSource.addEventListener('state', (e) => {
+  try {
+    const d = JSON.parse(e.data);
+    const stateEl = document.querySelector('[data-bot-state]');
+    if(stateEl) stateEl.textContent = d.state;
+  } catch(_) {}
+  loadSignalStatus();
+});
+evtSource.onerror = () => { console.warn('SSE 연결 끊김, 3초 후 재연결'); };
+</script>
+</body>
+</html>

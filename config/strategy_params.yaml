@@ -1,0 +1,248 @@
+# ============================================================
+# 전략 파라미터 설정 파일
+# 코드에 하드코딩하지 말고 이 파일에서만 조정할 것.
+# 백테스팅 그리드 서치 시 이 파일의 범위를 사용한다.
+# ============================================================
+
+# ── 심볼별 주문 수량 설정 (거래소 최소 주문 단위) ──
+# qty_precision: 수량 소수점 자릿수 / min_qty: 최소 주문 수량
+symbol_settings:
+  BTC/USDT:USDT:
+    qty_precision: 4
+    min_qty: 0.001
+  GMT/USDT:USDT:
+    qty_precision: 1
+    min_qty: 0.1
+  SUI/USDT:USDT:
+    qty_precision: 1
+    min_qty: 0.1
+
+# Layer 1: 추세 필터 (4H 캔들)
+trend_filter:
+  ema_fast: 21          # 단기 EMA
+  ema_mid: 55           # 중기 EMA
+  ema_slow: 200         # 장기 EMA (추세 방향 결정)
+  supertrend_period: 10  # Supertrend ATR 기간
+  supertrend_multiplier: 3.0  # Supertrend ATR 승수
+  timeframe: "4h"
+
+# Layer 2: 모멘텀 트리거 (1H 캔들)
+momentum:
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  rsi_period: 14
+  # 롱 진입 허용 RSI 범위 (완화: 신호 빈도 확보)
+  rsi_long_min: 35
+  rsi_long_max: 70
+  # 숏 진입 허용 RSI 범위 (완화: 신호 빈도 확보)
+  rsi_short_min: 30
+  rsi_short_max: 65
+  timeframe: "1h"
+
+# Layer 3: 미시 구조 확인 (15M 캔들)
+micro:
+  bb_period: 20         # 볼린저 밴드 기간
+  bb_std: 2.0           # 볼린저 밴드 표준편차
+  volume_multiplier: 1.2  # 거래량 = 평균 × 이 값 이상 (완화: 1.5 → 1.2)
+  timeframe: "15m"
+
+# 리스크 & 포지션 관리
+risk:
+  atr_period: 14
+  atr_sl_multiplier: 1.8    # SL = 진입가 ± ATR × 1.8 [완화: 1.5→1.8, 노이즈 피격 추가 감소]
+  atr_tp1_multiplier: 2.0   # TP1 = 진입가 ± ATR × 2.0  (R:R = 2:1)
+  atr_tp2_multiplier: 3.5   # TP2 = 진입가 ± ATR × 3.5  (R:R = 3.5:1)
+  tp1_exit_pct: 0.5         # TP1 도달 시 50% 청산
+  tp2_exit_pct: 0.3         # TP2 도달 시 추가 30% 청산 (잔여 20%는 트레일링)
+  partial_exit_pct: 0.5     # (레거시 호환) TP1 청산 비율
+  trailing_atr_multiplier: 2.0  # 트레일링 스탑 = 현재가 ± ATR × 2.0
+  kelly_fraction: 0.25      # Full Kelly의 25% (보수적 운용)
+  max_position_pct: 0.10    # 포지션당 최대 자본 10%
+  # ── 자율 거래 고도화 ──
+  breakeven_buffer_pct: 0.0006   # 본절 이동 시 수수료+슬리피지 버퍼 (진입가의 0.06%)
+  min_trail_step_ratio: 0.15     # 트레일링 재배치 최소 변경폭 (ATR × 0.15)
+  time_exit_profit_lock_pct: 0.003  # 타임 리밋 도달 시 이익률 > 0.3% 면 청산 대신 트레일링 유지
+  adaptive_sl_enabled: true      # TP1 전 ATR 변화에 따라 SL 거리 자동 조정
+
+# 진입 필터 (펀딩비, 이벤트 블랙아웃)
+filters:
+  # 펀딩비 과열 시 역방향 진입 차단
+  funding_rate_abs_threshold: 0.0005   # 0.05% (8시간 기준)
+  funding_filter_enabled: true
+  # 이벤트 블랙아웃: UTC 기준 시각 전후 N분 진입 금지
+  event_blackout_minutes: 30
+  event_blackout_enabled: true
+  event_times_utc:        # "YYYY-MM-DD HH:MM" UTC (CPI/FOMC 등)
+    []
+
+# 시장 레짐 감지 (regime_detector.py에서 사용)
+regime:
+  adx_trending_threshold: 25.0    # ADX > 25 = 추세 시장
+  adx_ranging_threshold: 15.0     # ADX < 15 = 횡보 시장  # [수정] 횡보 판정 완화 (기존: 20.0)
+  bb_bandwidth_low: 0.03          # BB 폭 < 0.03 = 횡보 확인
+  bb_bandwidth_high: 0.06         # BB 폭 > 0.06 = 고변동성
+  atr_pct_volatile: 0.02          # ATR/가격 > 2% = 고변동성
+  block_ranging: false            # [수정] 횡보장 차단 비활성화 (기존: true → 신호 빈도 개선)
+
+# 거래 시간 필터 (UTC 기준)
+trading_hours:
+  enabled: false                  # 24시간 시장 전 구간 거래 허용
+  start_hour_utc: 4               # UTC 04:00 이후 거래 허용 (enabled=true일 때만 적용)
+  end_hour_utc: 22                # UTC 22:00 이전 거래 허용 (enabled=true일 때만 적용)
+
+# 루프 타이밍
+timing:
+  signal_check_interval_sec: 60   # 시그널 평가 주기
+  position_monitor_interval_sec: 10  # 포지션 모니터 주기
+  candle_fetch_lookback: 300       # 캔들 조회 수 (지표 계산에 충분한 양)
+  max_trade_duration_hours: 48     # 최대 포지션 보유 시간 (타임 컷)
+
+# ── 거시경제 매크로 (macro_news.py + score_engine.py에서 사용) ──
+macro:
+  fg_extreme_fear: 20       # Fear & Greed 극단 공포 기준
+  fg_fear: 40               # 공포 기준
+  fg_greed: 60              # 탐욕 기준
+  fg_extreme_greed: 80      # 극단 탐욕 기준
+  event_danger_hours: 2.0   # 고영향 이벤트 위험 구간 (시간)
+  event_caution_hours: 6.0  # 고영향 이벤트 주의 구간 (시간)
+  btc_dom_high: 55.0        # BTC 도미넌스 높음 = 알트 약세
+  btc_dom_low: 42.0         # BTC 도미넌스 낮음 = 알트 시즌
+  macro_enabled: true       # 매크로 스코어링 활성화
+
+# ── 종합 스코어링 시스템 (score_engine.py에서 사용) ──
+scoring:
+  # 가중치 (합계 = 1.0, 매크로 추가로 재배분)
+  weight_trend: 0.25       # 추세 점수 가중치
+  weight_momentum: 0.22    # 모멘텀 점수 가중치
+  weight_volume: 0.18      # 볼륨 점수 가중치
+  weight_volatility: 0.12  # 변동성 점수 가중치
+  weight_sentiment: 0.10   # 심리 점수 가중치
+  weight_macro: 0.13       # 거시경제 매크로 가중치
+
+  # 진입 기준 점수 (0~100)
+  strong_signal_threshold: 75   # 강한 시그널 (완화: 80→75)
+  weak_signal_threshold: 55     # 약한 시그널  # [수정] 진입 임계값 완화 (기존: 65 → 55, 빈도 확보)
+  exit_threshold: 40            # 이 점수 이하면 청산 고려
+
+  # 시그널 결합 모드 (라이브): AND | OR | SCORE_ONLY
+  # - AND: Layer2 AND Layer3 모두 통과 (엄격, 기본)
+  # - OR: Layer2 OR Layer3 통과 + 스코어 >= weak_signal_threshold (완화)
+  # - SCORE_ONLY: 스코어만으로 진입 (최대 완화)
+  signal_combine_mode: "OR"      # [수정] 신호 결합 완화 (기존: "AND" → "OR", 신호 빈도 개선)
+
+  # ADX 기반 추세 강도
+  adx_strong: 25           # 강한 추세 기준
+  adx_very_strong: 40      # 매우 강한 추세 기준
+
+  # 스토캐스틱 구간
+  stoch_oversold: 20       # 과매도 기준
+  stoch_overbought: 80     # 과매수 기준
+
+  # OBV 판단 기간
+  obv_lookback: 5          # OBV 방향 판단용 lookback 캔들 수
+
+  # 볼린저 밴드 폭 기준 (변동성)
+  bb_bandwidth_low: 0.02   # 낮은 변동성 기준
+  bb_bandwidth_high: 0.08  # 높은 변동성 기준
+
+# ── 심리 지표 (온체인/파생상품 데이터) ──
+sentiment:
+  # 미결제약정(OI) 변화율 기준
+  oi_change_lookback_hours: 4      # OI 변화 측정 기간
+  oi_surge_threshold: 0.05         # OI 5% 이상 급증 = 의미 있는 변화
+  # 롱숏비율
+  long_short_extreme_long: 2.0     # 롱 과열 기준
+  long_short_extreme_short: 0.5    # 숏 과열 기준
+  # 펀딩비 심리 스코어링 (기존 filters와 별도)
+  funding_neutral_range: 0.0001    # ±0.01% 이내 = 중립
+
+# 백테스팅 그리드 서치 범위 (optimizer.py에서 사용)
+# 과적합 방지: 8개 → 4개 파라미터로 축소 (EMA/RSI 고정, ATR+Supertrend만 최적화)
+# 총 조합: 3×3×3×3 = 81개 (기존 6,561개 → 81개)
+optimizer_grid:
+  supertrend_multiplier: [2.5, 3.0, 3.5]
+  atr_sl_multiplier: [0.8, 1.0, 1.2]
+  atr_tp1_multiplier: [1.8, 2.0, 2.5]
+  atr_tp2_multiplier: [3.0, 3.5, 4.0]
+
+# 워크포워드 검증 설정
+walk_forward:
+  enabled: true
+  train_days: 45           # 학습 구간 (기존 90 → 45일)
+  test_days: 15            # 검증 구간 (기존 30 → 15일)
+  min_trades_per_window: 3 # 학습/검증 구간 최소 거래 수 (기존 6 → 3)
+  step_days: 15            # 슬라이딩 윈도우 스텝 (일)
+
+# 최소 거래 수 기준 (과적합 방지)
+min_trades: 15               # 초기 탐색용 (기존 24 → 15)
+
+# ── 백테스팅 전용 파라미터 (라이브와 분리) ──
+backtest:
+  signal_mode: "OR"              # "AND" (엄격) / "OR" (완화) / "SCORE_ONLY" (스코어만)  # [수정] 라이브와 통일 (기존: "AND")
+  min_score_threshold: 55        # 라이브와 동일  # [수정] 라이브 weak_signal_threshold와 통일 (기존: 70)
+  allow_partial_ema: true        # EMA 완전 정렬 불필요, price>ema_slow + supertrend만 확인
+  rsi_long_min: 35               # 라이브 40 → 35
+  rsi_long_max: 70               # 라이브 65 → 70
+  rsi_short_min: 30              # 라이브 35 → 30
+  rsi_short_max: 65              # 라이브 60 → 65
+  macd_cross_lookback: 5         # 라이브 3 → 5 (MACD 크로스 감지 범위 확대)
+  volume_multiplier: 1.2         # 라이브 1.5 → 1.2
+  bb_long_threshold: 0.40        # 라이브 0.35 → 0.40 (더 넓은 롱 진입 범위)
+  bb_short_threshold: 0.60       # 라이브 0.65 → 0.60 (더 넓은 숏 진입 범위)
+
+# ── 파라미터 민감도 분석 설정 ──
+sensitivity:
+  enabled: true
+  perturbation_pct: 0.15         # ±15% 변동
+  max_sharpe_drop_pct: 0.50      # 50% 이상 하락 시 과적합 판정
+
+# ============================================================
+# [고도화] 거시시황/뉴스 자동 대응 섹션
+# ============================================================
+
+# 실시간 뉴스 감시 (news_collector.py)
+# - 기본 무료 RSS(CoinDesk, Cointelegraph, Bitcoin Magazine)를 사용한다
+# - CRYPTOPANIC_API_KEY 환경변수가 있으면 CryptoPanic Hot Posts도 혼합한다
+# - 키워드(전쟁/제재/해킹/사토시/ETF/스테이블코인 디페그 등) 기반 위험도 산출
+news_watch:
+  enabled: true
+  poll_interval_sec: 300          # 5분 주기 수집
+  lookback_minutes: 120           # 최근 2시간 헤드라인만 평가
+  elevated_threshold: 20          # aggregate score ≥ → ELEVATED (경고만)
+  high_threshold: 40              # HIGH: 모든 포지션 reduce_on_high_ratio 만큼 축소 + 진입 차단
+  critical_threshold: 70          # CRITICAL: 전량 청산 + 진입 차단
+  reduce_on_high_ratio: 0.5       # HIGH 감지 시 각 포지션 50% 축소
+  close_all_on_critical: true     # CRITICAL 감지 시 전량 청산
+  pause_entries_on_high: true     # HIGH 이상 시 신규 진입 일시 정지
+
+# 변동성 급증 감지 (volatility_spike.py)
+# - 돌발 뉴스 직후 15m 봉에서 실현변동성/수익률 z-score/레인지가 동시에 튀는 순간을 잡아
+#   기존 ATR 손절선까지 끌려가기 전에 선제적으로 전량 청산한다
+vol_spike:
+  enabled: true
+  timeframe: "15m"
+  recent_bars: 3                  # 최근 3봉 실현변동성
+  baseline_bars: 72               # 과거 18시간(15m×72) 평균
+  vol_ratio_threshold: 3.0        # 최근 표준편차가 과거 평균의 3배
+  z_threshold: 3.5                # 최근 봉 수익률 |z| ≥ 3.5σ
+  range_ratio_threshold: 3.0      # 현재 봉 레인지가 과거 평균의 3배
+  close_all_on_spike: true        # 스파이크 감지 시 전 포지션 강제 청산
+  pause_minutes_after_spike: 60   # 이후 60분 신규 진입 차단
+
+# 예정된 고영향 경제 이벤트 선제 대응 (FOMC/CPI/NFP 등)
+# - macro_news.py 의 캘린더와 연동해 시간 임박도에 따라 단계적 대응
+event_action:
+  enabled: true
+  pre_event_reduce_hours: 2.0     # 이벤트 2시간 전부터 절반 축소 대상
+  pre_event_reduce_ratio: 0.5     # 절반 청산
+  pre_event_close_hours: 0.5      # 이벤트 30분 전부터 전량 청산
+  resume_minutes_after: 45        # 이벤트 종료 후 45분 뒤 재개 허용
+
+# 드로다운 정지 후 자동 복구
+# - HALTED 상태에서도 risk_monitor가 복구 조건을 주기적으로 확인한다
+auto_resume:
+  enabled: true
+  min_halt_minutes: 120           # 최소 2시간은 정지 유지
+  recovery_drawdown_pct: 0.08     # 드로다운이 8% 이하로 내려와야 복구
+  max_auto_resumes_per_day: 1     # 하루 최대 1회 자동 복구
