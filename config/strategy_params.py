@@ -2,6 +2,7 @@
 strategy_params.yaml을 로딩하는 dataclass 정의.
 전략 모듈은 이 파일의 dataclass를 사용해 파라미터를 주입받는다.
 """
+import functools
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -9,7 +10,14 @@ from typing import Any
 import yaml
 
 
+@functools.lru_cache(maxsize=1)
 def _load_yaml() -> dict:
+    """YAML 파일을 읽어 dict를 반환한다.
+
+    lru_cache(maxsize=1) 로 프로세스 수명 동안 최초 1회만 파일 I/O를 수행한다.
+    async 이벤트 루프를 블로킹하지 않기 위해 반복 호출을 캐싱한다.
+    운영 중 YAML 핫-리로드가 필요하면 _load_yaml.cache_clear() 를 호출하면 된다.
+    """
     yaml_path = Path(__file__).parent / "strategy_params.yaml"
     with open(yaml_path, encoding="utf-8") as f:
         return yaml.safe_load(f)
@@ -325,6 +333,62 @@ class AutoResumeParams:
 
 
 @dataclass
+class SymbolRotationParams:
+    """주간 심볼 로테이션 설정."""
+    enabled: bool = True
+    rotation_interval_hours: int = 168  # 7일
+    top_n_symbols: int = 3
+    candidate_pool: list = None
+
+    def __post_init__(self):
+        if self.candidate_pool is None:
+            self.candidate_pool = []
+
+    @classmethod
+    def from_dict(cls, cfg: dict) -> "SymbolRotationParams":
+        return cls(**{k: v for k, v in cfg.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class X10GoalParams:
+    """1년 10x 목표 전략 파라미터."""
+    initial_capital: float = 1096.0
+    target_capital: float = 10960.0
+    monthly_target_pct: float = 0.2144
+    start_date: str = "2026-04-24"
+    symbol_rotation: SymbolRotationParams = None
+    symbols: list = None
+    phase_kelly_scales: dict = None
+
+    def __post_init__(self):
+        if self.symbol_rotation is None:
+            self.symbol_rotation = SymbolRotationParams()
+        if self.symbols is None:
+            self.symbols = []
+        if self.phase_kelly_scales is None:
+            self.phase_kelly_scales = {
+                "AHEAD": 0.60,
+                "ON_PACE": 1.00,
+                "BEHIND": 1.15,
+                "CHASE": 1.30,
+            }
+
+    @classmethod
+    def from_yaml(cls) -> "X10GoalParams":
+        raw = _load_yaml().get("x10_goal", {}) or {}
+        # symbol_rotation은 nested dict이므로 별도 처리
+        rot_cfg = raw.pop("symbol_rotation", {}) or {}
+        rot = SymbolRotationParams.from_dict(rot_cfg)
+        # scenarios와 monthly_equity_schedule는 무시 (백테스터 전용)
+        raw.pop("scenarios", None)
+        raw.pop("monthly_equity_schedule", None)
+        fields = {k: v for k, v in raw.items() if k in cls.__dataclass_fields__}
+        obj = cls(**fields)
+        obj.symbol_rotation = rot
+        return obj
+
+
+@dataclass
 class AllStrategyParams:
     trend: TrendFilterParams
     momentum: MomentumParams
@@ -343,6 +407,7 @@ class AllStrategyParams:
     vol_spike: VolSpikeParams = None
     event_action: EventActionParams = None
     auto_resume: AutoResumeParams = None
+    x10_goal: X10GoalParams = None
 
     def __post_init__(self):
         if self.backtest is None:
@@ -363,6 +428,8 @@ class AllStrategyParams:
             self.event_action = EventActionParams()
         if self.auto_resume is None:
             self.auto_resume = AutoResumeParams()
+        if self.x10_goal is None:
+            self.x10_goal = X10GoalParams()
 
     @classmethod
     def from_yaml(cls) -> "AllStrategyParams":
@@ -384,4 +451,5 @@ class AllStrategyParams:
             vol_spike=VolSpikeParams.from_yaml(),
             event_action=EventActionParams.from_yaml(),
             auto_resume=AutoResumeParams.from_yaml(),
+            x10_goal=X10GoalParams.from_yaml(),
         )

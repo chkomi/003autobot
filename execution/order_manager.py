@@ -4,6 +4,8 @@ OKX에 실제 주문을 전송하고 SL/TP 알고 주문을 관리한다.
 멀티 심볼: 심볼은 signal/trade에서 가져온다.
 
 [개선] 시장가 주문 실패 시 자동 재시도 + 포지션 이중 오픈 방지 검증 포함.
+[버그수정] 청산 5회 실패 시 ClosePositionFailedError 발생 (호출자가 긴급 알림 처리).
+[버그수정] 진입 주문 부분 체결 시 filled_qty 기준으로 SL/TP 배치.
 """
 import asyncio
 from datetime import datetime, timezone
@@ -13,7 +15,7 @@ import aiohttp
 from loguru import logger
 
 from config.settings import TradingConfig
-from core.exceptions import APIError, OrderError
+from core.exceptions import APIError, ClosePositionFailedError, OrderError
 from data.okx_rest_client import OKXRestClient
 from database.models import TradeRecord
 from risk.position_sizer import PositionSize
@@ -64,11 +66,28 @@ class OrderManager:
         filled_price = float(order.get("average") or order.get("price") or signal.entry_price)
         entry_time = datetime.now(timezone.utc).isoformat()
 
-        # TradeRecord 생성
+        # ── [버그4] 실제 체결 수량 확인 ─────────────────────────────
+        # OKX 응답의 'filled' 필드 우선, 없으면 info.fillSz, 최종 폴백은 요청 수량
+        filled_qty = float(
+            order.get("filled")
+            or order.get("info", {}).get("fillSz")
+            or pos_size.quantity
+        )
+        is_partial_fill = filled_qty < pos_size.quantity - 1e-8
+        if is_partial_fill:
+            logger.warning(
+                f"[{sym_tag}] 부분 체결 감지: 요청 {pos_size.quantity:.4f} → "
+                f"실제 체결 {filled_qty:.4f} "
+                f"(미체결 {pos_size.quantity - filled_qty:.4f})"
+            )
+        # SL/TP는 실제 체결 수량 기준으로 배치해야 수량 초과 오류를 방지한다
+        sl_tp_qty = round(filled_qty, 4)
+
+        # TradeRecord 생성 — DB에 실제 체결 수량 저장
         trade = TradeRecord(
             symbol=symbol,
             direction=signal.direction,
-            quantity=pos_size.quantity,
+            quantity=sl_tp_qty,          # 실제 체결량
             leverage=self._config.leverage,
             entry_price=filled_price,
             stop_loss=signal.stop_price,
@@ -78,20 +97,26 @@ class OrderManager:
             signal_confidence=signal.confidence,
             atr_at_entry=signal.atr_value,
         )
+        # 부분 체결 여부를 메타데이터에 기록 (상위 레이어에서 알림에 사용)
+        trade.partial_fill = is_partial_fill
+        trade.requested_qty = pos_size.quantity
 
-        # SL 알고 주문 (최대 3회 재시도)
+        # SL 알고 주문 — sl_tp_qty(실제 체결량) 기준, 최대 3회 재시도
         sl_side = "sell" if signal.direction == "LONG" else "buy"
         for sl_attempt in range(1, 4):
             try:
                 sl_order = await self._rest.create_sl_order(
                     symbol=symbol,
                     side=sl_side,
-                    amount=pos_size.quantity,
+                    amount=sl_tp_qty,          # 실제 체결량 기준
                     sl_trigger_price=signal.stop_price,
                     pos_side=pos_side,
                 )
                 trade.sl_algo_id = sl_order.get("id") or sl_order.get("info", {}).get("algoId")
-                logger.info(f"[{sym_tag}] SL 알고 주문 배치: ${signal.stop_price:,.2f} (ID: {trade.sl_algo_id})")
+                logger.info(
+                    f"[{sym_tag}] SL 알고 주문 배치: ${signal.stop_price:,.2f} "
+                    f"qty={sl_tp_qty:.4f} (ID: {trade.sl_algo_id})"
+                )
                 break
             except (aiohttp.ClientError, OrderError, APIError) as e:
                 if sl_attempt < 3:
@@ -104,7 +129,8 @@ class OrderManager:
 
         logger.info(
             f"[{sym_tag}] 포지션 오픈 완료: {trade.trade_id} | "
-            f"{trade.direction} {trade.quantity:.4f} @ ${filled_price:,.2f}"
+            f"{trade.direction} {sl_tp_qty:.4f} @ ${filled_price:,.2f}"
+            + (f" [부분체결: 요청 {pos_size.quantity:.4f}]" if is_partial_fill else "")
         )
         return trade
 
@@ -117,7 +143,8 @@ class OrderManager:
         """포지션을 시장가로 전부 청산하고 체결가를 반환한다.
 
         청산 주문은 실패 시 _CLOSE_MAX_RETRY회까지 재시도한다.
-        모든 재시도 실패 시 current_price를 사용한 소프트웨어 청산 가격으로 폴백한다.
+        모든 재시도 실패 시 ClosePositionFailedError를 발생시킨다.
+        호출자(trade_lifecycle._close)가 해당 예외를 잡아 텔레그램 긴급 알림을 발송한다.
         """
         symbol = trade.symbol
         sym_tag = symbol.split("/")[0]
@@ -159,15 +186,23 @@ class OrderManager:
                     await asyncio.sleep(wait)
                 else:
                     logger.critical(
-                        f"[{sym_tag}] 청산 주문 최종 실패 — current_price 폴백 적용: {e}"
+                        f"[{sym_tag}] 청산 주문 {_CLOSE_MAX_RETRY}회 전부 실패 — "
+                        f"거래소 포지션이 아직 열려 있을 수 있음! "
+                        f"마지막 오류: {e}"
                     )
 
-        # 모든 재시도 실패 → current_price를 사용한 소프트웨어 청산가로 폴백
+        # ── [버그1] 모든 재시도 실패 → 예외 발생 (호출자가 긴급 알림 처리 후 폴백 적용) ──
+        # 이전 코드는 return current_price로 조용히 폴백했으나,
+        # 거래소에 포지션이 남아 있을 위험이 있어 명시적 예외로 변경.
         logger.critical(
-            f"[{sym_tag}] 청산 실패! 거래소 포지션 수동 확인 필요. "
-            f"내부 P&L 계산은 현재가 ${current_price:,.2f} 기준으로 처리됨."
+            f"[{sym_tag}] ClosePositionFailedError 발생 — "
+            f"폴백 가격 ${current_price:,.2f} 적용, 수동 확인 필요"
         )
-        return current_price
+        raise ClosePositionFailedError(
+            symbol=symbol,
+            trade_id=trade.trade_id,
+            fallback_price=current_price,
+        )
 
     async def update_stop_loss(
         self, trade: TradeRecord, new_stop_price: float

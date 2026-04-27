@@ -1,0 +1,106 @@
+# Autobot 로컬 개발 환경 (plan v2 §14)
+#
+# 실행:
+#   docker-compose up -d          # 백그라운드 시작
+#   docker-compose logs -f api    # API 로그 실시간 확인
+#   docker-compose down           # 종료
+#
+# 첫 실행 전 준비:
+#   cp .env.example .env.local    # 환경변수 파일 복사 후 값 입력
+#   docker-compose run --rm api alembic upgrade head   # DB 마이그레이션
+#
+# 포트:
+#   API  : http://localhost:8080  (Swagger: http://localhost:8080/docs)
+#   DB   : localhost:5432
+#   Redis: localhost:6379
+
+version: "3.9"
+
+services:
+
+  # ── PostgreSQL 15 ────────────────────────────────────────────────
+  db:
+    image: postgres:15-alpine
+    container_name: autobot_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: autobot
+      POSTGRES_PASSWORD: autobot
+      POSTGRES_DB: autobot
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autobot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Redis 7 ─────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: autobot_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Autobot API ──────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: autobot_api
+    restart: unless-stopped
+    env_file:
+      - .env.local
+    environment:
+      AUTOBOT_API_DATABASE_URL: postgresql+asyncpg://autobot:autobot@db:5432/autobot
+      AUTOBOT_API_REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./data_cache:/app/data_cache   # SQLite 폴백 및 캐시 파일
+      - ./logs:/app/logs               # 로그 공유
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8080 --workers 2
+
+  # ── RQ Backtest Worker ───────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: autobot_worker
+    restart: unless-stopped
+    env_file:
+      - .env.local
+    environment:
+      AUTOBOT_API_DATABASE_URL: postgresql+asyncpg://autobot:autobot@db:5432/autobot
+      AUTOBOT_API_REDIS_URL: redis://redis:6379/0
+      RQ_QUEUE_NAMES: backtest
+      RQ_BURST: "0"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./data_cache:/app/data_cache
+      - ./logs:/app/logs
+    command: python worker.py
+
+volumes:
+  postgres_data:
+  redis_data:

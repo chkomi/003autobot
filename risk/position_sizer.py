@@ -58,6 +58,7 @@ class PositionSizer:
         avg_win_ratio: Optional[float] = None,
         avg_loss_ratio: Optional[float] = None,
         drawdown_pct: float = 0.0,
+        goal_kelly_scale: float = 1.0,
     ) -> PositionSize:
         """포지션 사이즈를 계산한다.
 
@@ -87,6 +88,11 @@ class PositionSizer:
             scale = max(1.0 - (drawdown_pct / max_dd), 0.2)  # 최소 20% 유지
             kelly_f *= scale
             logger.debug(f"드로다운 스케일링: DD={drawdown_pct:.2%}, 배수={scale:.2f}, 조정Kelly={kelly_f:.4f}")
+
+        # 목표 달성률 기반 포지션 조정 (GoalTracker 제공)
+        if goal_kelly_scale != 1.0:
+            kelly_f *= goal_kelly_scale
+            logger.debug(f"목표 달성 스케일링: 배수={goal_kelly_scale:.2f}, 조정Kelly={kelly_f:.4f}")
 
         # 2. 리스크 기반 사이징 (손절폭 대비 자본 비율)
         risk_pct = abs(entry_price - stop_price) / entry_price  # SL 거리 비율

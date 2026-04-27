@@ -17,6 +17,9 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+# KST = UTC+9 (한국 표준시)
+_KST = timezone(timedelta(hours=9))
+
 import aiohttp
 from loguru import logger
 
@@ -35,7 +38,9 @@ from risk.stop_manager import StopManager
 from dashboard.server import push_sse_event
 from data.macro_news import MacroNewsCollector, MacroSnapshot
 from data.news_collector import NewsCollector, NewsRiskSnapshot
+from risk.goal_tracker import GoalTracker
 from strategy.feedback_loop import FeedbackLoop
+from strategy.symbol_ranker import SymbolRanker
 from strategy.score_engine import MacroData
 from strategy.ml_filter import MLSignalFilter
 from strategy.signal_aggregator import SignalAggregator
@@ -72,7 +77,12 @@ class BotEngine:
         self._state = StateManager()
         self._tasks: list[asyncio.Task] = []
         self._feedback = FeedbackLoop(db)
+        self._goal = GoalTracker(db, settings.goal, notifier)
         self._ml_filter = MLSignalFilter()
+        # 심볼 로테이터 (주간 모멘텀 기반)
+        self._symbol_ranker: Optional[SymbolRanker] = None  # REST 클라이언트 접근 후 초기화
+        self._active_symbols: list[str] = list(settings.trading.symbol_list)
+        self._last_symbol_rotation: Optional[datetime] = None
         self._macro_collector = MacroNewsCollector()
         self._macro_snapshot: MacroSnapshot | None = None
         # 심볼별 OI 변화율 추적
@@ -105,6 +115,8 @@ class BotEngine:
         self._pause_until: Optional[datetime] = None
         # 이벤트별 선제 축소/청산 적용 기록 (중복 트리거 방지)
         self._event_actions_applied: dict[str, str] = {}  # event_title → "REDUCED"|"CLOSED"
+        # 스파이크 중복 트리거 방지: 심볼별 마지막 스파이크 캔들 타임스탬프
+        self._last_spike_candle_ts: dict[str, object] = {}  # symbol → pd.Timestamp
         # 자동 복구 카운터 (day key → count)
         self._auto_resume_counts: dict[str, int] = {}
 
@@ -116,6 +128,12 @@ class BotEngine:
         self._loop_error_last_alert: dict[str, datetime] = {}
         self._loop_error_alert_threshold: int = 5    # N회 연속 에러 시 텔레그램 발송
         self._loop_error_alert_cooldown_sec: int = 600  # 같은 루프 알림 재발송 쿨다운(초)
+
+        # [버그2] KST 자정 일일 리셋 감지용 날짜 추적
+        self._current_kst_date: Optional[str] = None
+
+        # [버그3] HALT 즉시 중단을 위한 이벤트 (set → 모든 루프 즉시 탈출)
+        self._halt_event: asyncio.Event = asyncio.Event()
 
     @property
     def state(self) -> BotState:
@@ -153,6 +171,9 @@ class BotEngine:
         except (KeyError, ValueError) as e:
             logger.warning(f"매크로 데이터 초기 로딩 실패 (파싱): {e}")
 
+        # [버그1] 봇 시작 시 포지션 reconciliation — 유령/고아 포지션 감지 및 복구
+        await self._reconcile_positions()
+
         # 비동기 루프 시작
         self._tasks = [
             asyncio.create_task(self._candle_refresh_loop(), name="candle-loop"),
@@ -171,6 +192,11 @@ class BotEngine:
             self._tasks.append(asyncio.create_task(self._event_action_loop(), name="event-loop"))
         # [Watchdog] 시그널 체크 감시 루프
         self._tasks.append(asyncio.create_task(self._watchdog_loop(), name="watchdog-loop"))
+        # [10x] 주간 심볼 로테이션 루프
+        rotation_cfg = getattr(self._params, 'x10_goal', None)
+        if rotation_cfg and getattr(getattr(rotation_cfg, 'symbol_rotation', None), 'enabled', False):
+            self._symbol_ranker = SymbolRanker(self._market._rest)
+            self._tasks.append(asyncio.create_task(self._symbol_rotation_loop(), name="rotation-loop"))
 
         await asyncio.gather(*self._tasks, return_exceptions=True)
 
@@ -189,30 +215,36 @@ class BotEngine:
 
     async def _candle_refresh_loop(self) -> None:
         """모든 심볼의 타임프레임별 캔들을 주기적으로 갱신한다."""
-        while self._state.state != BotState.HALTED:
+        # [버그3] _halt_event 기반 조건 — HALT 시 즉시 탈출
+        while not self._halt_event.is_set():
             try:
                 for symbol in self._market.symbols:
+                    if self._halt_event.is_set():
+                        return
                     for tf in self._s.trading.all_timeframes:
                         await self._market.refresh_candles(tf, symbol=symbol)
-                await asyncio.sleep(self._s.trading.signal_check_interval_sec)
+                await self._sleep_interruptible(self._s.trading.signal_check_interval_sec)
             except asyncio.CancelledError:
                 break
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.error(f"캔들 갱신 루프 네트워크 오류: {e}")
                 await self._maybe_send_loop_error_alert("candle-loop", f"네트워크 오류: {e}")
-                await asyncio.sleep(30)
+                await self._sleep_interruptible(30)
             except (KeyError, ValueError) as e:
                 logger.error(f"캔들 갱신 루프 데이터 오류: {e}")
                 await self._maybe_send_loop_error_alert("candle-loop", f"데이터 오류: {e}")
-                await asyncio.sleep(30)
+                await self._sleep_interruptible(30)
 
     # ── 루프 2: 시그널 평가 (멀티 심볼) ─────────────────────────
 
     async def _signal_loop(self) -> None:
         """각 심볼별로 시그널을 평가하고 진입 조건 충족 시 포지션을 연다."""
-        while self._state.state != BotState.HALTED:
+        # [버그3] _halt_event 기반 조건 — HALT 시 즉시 탈출
+        while not self._halt_event.is_set():
             try:
-                await asyncio.sleep(self._s.trading.signal_check_interval_sec)
+                await self._sleep_interruptible(self._s.trading.signal_check_interval_sec)
+                if self._halt_event.is_set():
+                    break
 
                 # Watchdog: 루프 생존 확인
                 self._last_signal_check = datetime.now(timezone.utc)
@@ -238,12 +270,12 @@ class BotEngine:
                 logger.error(f"시그널 루프 네트워크 오류: {e}")
                 self._state.transition(BotState.WATCHING, f"네트워크 예외 복구: {e}")
                 await self._maybe_send_loop_error_alert("signal-loop", f"네트워크 오류: {e}")
-                await asyncio.sleep(10)
+                await self._sleep_interruptible(10)
             except (KeyError, ValueError, TypeError) as e:
                 logger.error(f"시그널 루프 데이터 오류: {e}")
                 self._state.transition(BotState.WATCHING, f"데이터 예외 복구: {e}")
                 await self._maybe_send_loop_error_alert("signal-loop", f"데이터 오류: {e}")
-                await asyncio.sleep(10)
+                await self._sleep_interruptible(10)
 
     async def _evaluate_symbol(self, symbol: str) -> None:
         """단일 심볼에 대한 시그널 평가 및 진입 처리"""
@@ -354,11 +386,62 @@ class BotEngine:
         await self._db.insert_trade(trade)
 
         await self._notifier.on_trade_opened(trade, signal.entry_price)
+
+        # [버그4] 부분 체결 발생 시 텔레그램 알림
+        is_partial = getattr(trade, "partial_fill", False)
+        requested_qty = getattr(trade, "requested_qty", report.position_size.quantity)
+        if is_partial:
+            await self._notifier.on_alert(
+                "WARNING",
+                (
+                    f"⚠️ <b>[부분 체결]</b> {sym_tag} {trade.direction}\n"
+                    f"요청 수량: {requested_qty:.4f} → 체결 수량: {trade.quantity:.4f}\n"
+                    f"미체결: {requested_qty - trade.quantity:.4f} | "
+                    f"SL/TP는 체결 수량 기준으로 설정됨"
+                ),
+            )
+
+        # 진입 컨텍스트(score breakdown, regime 등)를 metadata에 기록 (Trade Journal 백필 소스)
+        entry_metadata = {
+            "trade_id": trade.trade_id,
+            "symbol": symbol,
+            "direction": trade.direction,
+        }
+        if signal.score is not None:
+            entry_metadata["score"] = {
+                "total": round(signal.score.total, 2),
+                "trend": round(signal.score.trend, 2),
+                "momentum": round(signal.score.momentum, 2),
+                "volume": round(signal.score.volume, 2),
+                "volatility": round(signal.score.volatility, 2),
+                "sentiment": round(signal.score.sentiment, 2),
+                "macro": round(signal.score.macro, 2),
+                "strength": signal.score.signal_strength,
+            }
+        if signal.regime is not None:
+            entry_metadata["regime"] = {
+                "label": signal.regime.regime,
+                "adx": round(signal.regime.adx_value, 2),
+                "bb_bw": round(signal.regime.bb_bandwidth, 4),
+                "atr_pct": round(signal.regime.atr_pct, 4),
+            }
+        if signal.momentum is not None:
+            entry_metadata["momentum"] = {
+                "macd_cross": signal.momentum.macd_cross,
+                "rsi": round(signal.momentum.rsi_value, 2),
+            }
+        if signal.micro is not None:
+            entry_metadata["micro"] = {
+                "bb_pct": round(signal.micro.bb_pct, 3),
+                "volume_confirmed": signal.micro.volume_confirmed,
+            }
+
         await self._db.log_event(BotEvent(
             event_type="ORDER",
             level="INFO",
-            message=f"포지션 오픈: {trade.trade_id} {sym_tag} {trade.direction}",
-            metadata={"trade_id": trade.trade_id, "symbol": symbol, "direction": trade.direction},
+            message=f"포지션 오픈: {trade.trade_id} {sym_tag} {trade.direction}"
+                    + (f" [부분체결:{trade.quantity:.4f}/{requested_qty:.4f}]" if is_partial else ""),
+            metadata=entry_metadata,
         ))
 
         self._state.transition(BotState.IN_TRADE, f"{sym_tag} {trade.trade_id}")
@@ -368,9 +451,12 @@ class BotEngine:
 
     async def _position_monitor_loop(self) -> None:
         """열린 포지션을 주기적으로 점검한다."""
-        while self._state.state != BotState.HALTED:
+        # [버그3] _halt_event 기반 조건 — HALT 시 즉시 탈출
+        while not self._halt_event.is_set():
             try:
-                await asyncio.sleep(self._s.trading.position_monitor_interval_sec)
+                await self._sleep_interruptible(self._s.trading.position_monitor_interval_sec)
+                if self._halt_event.is_set():
+                    break
 
                 open_trades = await self._tracker.sync_open_positions()
                 if not open_trades:
@@ -421,19 +507,47 @@ class BotEngine:
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.error(f"포지션 모니터 루프 네트워크 오류: {e}")
                 await self._maybe_send_loop_error_alert("position-loop", f"네트워크 오류: {e}")
-                await asyncio.sleep(15)
+                await self._sleep_interruptible(15)
             except (KeyError, ValueError, TypeError) as e:
                 logger.error(f"포지션 모니터 루프 데이터 오류: {e}")
                 await self._maybe_send_loop_error_alert("position-loop", f"데이터 오류: {e}")
-                await asyncio.sleep(15)
+                await self._sleep_interruptible(15)
 
     # ── 루프 4: 리스크 모니터 ────────────────────────────────────
 
     async def _risk_monitor_loop(self) -> None:
-        """드로다운/일일 손실 감시 + [고도화] HALTED 상태에서의 자동 복구 체크."""
+        """드로다운/일일 손실 감시 + [고도화] HALTED 상태에서의 자동 복구 체크.
+        [버그2] KST 자정 일일 리셋 감지 및 텔레그램 알림 추가.
+        """
         while True:  # HALTED 상태에서도 자동 복구 체크를 위해 계속 돌린다
             try:
                 await asyncio.sleep(60)  # 1분 주기
+
+                # [버그2] KST 자정 감지 → 일일 손실 한도 자동 리셋
+                now_kst_date = datetime.now(_KST).strftime("%Y-%m-%d")
+                if self._current_kst_date is None:
+                    self._current_kst_date = now_kst_date  # 최초 초기화
+                elif now_kst_date != self._current_kst_date:
+                    prev_date = self._current_kst_date
+                    self._current_kst_date = now_kst_date
+                    self._risk.reset_daily()
+                    logger.info(
+                        f"[DailyReset] KST 날짜 전환: {prev_date} → {now_kst_date} "
+                        f"— 일일 손실 한도 리셋, 거래 재개"
+                    )
+                    await self._notifier.on_alert(
+                        "INFO",
+                        (
+                            f"🌅 <b>일일 리셋 완료</b>\n"
+                            f"날짜 전환: {prev_date} → {now_kst_date} (KST)\n"
+                            f"일일 손실 한도 초기화 — 정상 거래 재개"
+                        ),
+                    )
+                    await self._db.log_event(BotEvent(
+                        event_type="DAILY_RESET",
+                        level="INFO",
+                        message=f"KST 자정 일일 리셋: {prev_date} → {now_kst_date}",
+                    ))
 
                 balance_info = await self._market.get_balance()
                 equity = balance_info.get("total", 0)
@@ -508,19 +622,53 @@ class BotEngine:
     # ── 루프 5: 피드백 루프 (성과 분석) ────────────────────────────
 
     async def _feedback_loop(self) -> None:
-        """일정 주기로 성과를 분석하고, 자동 튜닝 및 ML 재학습을 수행한다."""
-        while self._state.state != BotState.HALTED:
+        """KST 자정마다 하루 성과를 분석하고, 자동 튜닝 및 ML 재학습을 수행한다."""
+        # [버그3] _halt_event 기반 조건
+        while not self._halt_event.is_set():
             try:
-                # 6시간마다 실행
-                await asyncio.sleep(6 * 3600)
+                # 다음 KST 자정(00:00)까지 대기
+                now_kst = datetime.now(_KST)
+                next_midnight_kst = (now_kst + timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+                sleep_sec = (next_midnight_kst - now_kst).total_seconds()
+                await self._sleep_interruptible(sleep_sec)
+                if self._halt_event.is_set():
+                    break
 
-                report = await self._feedback.generate_daily_report()
-                if report.total_trades > 0:
-                    await self._notifier.on_alert(
-                        "INFO",
-                        report.to_telegram_html(),
+                # 자정이 지난 직후 → 어제(KST) 날짜로 리포트 생성
+                yesterday_kst = (datetime.now(_KST) - timedelta(days=1)).strftime("%Y-%m-%d")
+                report = await self._feedback.generate_daily_report(date_str=yesterday_kst)
+
+                # daily_pnl 테이블에서 집계된 당일 수익 조회
+                daily_pnl = await self._db.get_daily_pnl(yesterday_kst)
+                try:
+                    balance_info = await self._market.get_balance()
+                    equity = balance_info.get("total", 0.0)
+                except Exception:
+                    equity = 0.0
+
+                if report.total_trades > 0 or daily_pnl.pnl_usdt != 0:
+                    await self._notifier.on_daily_summary(
+                        date=yesterday_kst,
+                        pnl_usdt=daily_pnl.pnl_usdt,
+                        trade_count=daily_pnl.trade_count,
+                        win_rate=report.win_rate,
+                        equity=equity,
                     )
-                    logger.info(f"[피드백] 리포트 전송\n{report.summary()}")
+                    # 상세 분석 리포트는 별도 on_alert로 전송 (제안 사항 포함)
+                    if report.suggestions:
+                        await self._notifier.on_alert("INFO", report.to_telegram_html())
+                    logger.info(f"[피드백] 일일 리포트 전송 ({yesterday_kst})\n{report.summary()}")
+
+                # 포트폴리오 목표 추적 업데이트 (이정표 감지 + 월간 메트릭)
+                try:
+                    await self._goal.update_nightly(equity, yesterday_kst)
+                    # 포트폴리오 요약을 매일 자정 함께 발송
+                    portfolio_html = await self._goal.get_portfolio_summary_html(equity)
+                    await self._notifier.on_alert("INFO", portfolio_html)
+                except Exception as e:
+                    logger.error(f"GoalTracker 업데이트 실패: {e}")
 
                 # 자동 파라미터 튜닝 (20건 이상 거래 시)
                 try:
@@ -550,18 +698,102 @@ class BotEngine:
                 break
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.error(f"피드백 루프 네트워크 오류: {e}")
-                await asyncio.sleep(300)
+                await self._sleep_interruptible(300)
             except (KeyError, ValueError) as e:
                 logger.error(f"피드백 루프 데이터 오류: {e}")
-                await asyncio.sleep(300)
+                await self._sleep_interruptible(300)
+
+    # ── 루프 5b: 주간 심볼 로테이션 ───────────────────────────────
+
+    async def _symbol_rotation_loop(self) -> None:
+        """매주 일요일 KST 자정마다 모멘텀 상위 심볼로 거래 대상을 교체한다."""
+        while not self._halt_event.is_set():
+            try:
+                # 다음 일요일 KST 자정(00:00)까지 대기
+                now_kst = datetime.now(_KST)
+                days_until_sunday = (6 - now_kst.weekday()) % 7  # 0 = 오늘이 일요일
+                if days_until_sunday == 0 and now_kst.hour < 1:
+                    days_until_sunday = 0  # 오늘 자정이 지난 지 얼마 안 됨 → 즉시 실행
+                else:
+                    days_until_sunday = days_until_sunday if days_until_sunday > 0 else 7
+                next_sunday = (now_kst + timedelta(days=days_until_sunday)).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+                sleep_sec = (next_sunday - now_kst).total_seconds()
+                # 최소 10분은 대기 (무한 루프 방지)
+                sleep_sec = max(sleep_sec, 600)
+                await self._sleep_interruptible(sleep_sec)
+                if self._halt_event.is_set():
+                    break
+
+                if self._symbol_ranker is None:
+                    continue
+
+                # 10x 목표 후보 심볼 풀에서 상위 N개 선택
+                rotation_cfg = getattr(self._params, 'x10_goal', None)
+                if rotation_cfg is None:
+                    continue
+
+                sym_rot = getattr(rotation_cfg, 'symbol_rotation', None)
+                if sym_rot is None:
+                    continue
+
+                candidates = getattr(sym_rot, 'candidate_pool', self._active_symbols)
+                top_n = getattr(sym_rot, 'top_n_symbols', 3)
+
+                try:
+                    new_symbols = await self._symbol_ranker.rank_symbols_list(
+                        candidates, top_n=top_n
+                    )
+                except Exception as e:
+                    logger.warning(f"[심볼 로테이션] 랭킹 실패 (기존 심볼 유지): {e}")
+                    continue
+
+                if not new_symbols:
+                    logger.warning("[심볼 로테이션] 빈 결과 — 기존 심볼 유지")
+                    continue
+
+                old_symbols = list(self._active_symbols)
+                added = [s for s in new_symbols if s not in old_symbols]
+                removed = [s for s in old_symbols if s not in new_symbols]
+
+                if not added and not removed:
+                    logger.info("[심볼 로테이션] 변경 없음")
+                    continue
+
+                # 심볼 업데이트
+                self._active_symbols = new_symbols
+                self._market.update_symbols(new_symbols)
+                self._last_symbol_rotation = datetime.now(_KST)
+
+                # 따뜻한 업 (새 심볼 캔들 로딩)
+                if added:
+                    logger.info(f"[심볼 로테이션] 신규 심볼 데이터 로딩: {added}")
+                    await self._market.warm_up_symbols(added)
+
+                rotation_msg = (
+                    f"🔄 <b>주간 심볼 로테이션</b>\n"
+                    f"➕ 추가: {', '.join(s.split('/')[0] for s in added) or '-'}\n"
+                    f"➖ 제거: {', '.join(s.split('/')[0] for s in removed) or '-'}\n"
+                    f"✅ 활성: {', '.join(s.split('/')[0] for s in new_symbols)}"
+                )
+                logger.info(rotation_msg.replace("<b>", "").replace("</b>", ""))
+                await self._notifier.on_alert("INFO", rotation_msg)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"심볼 로테이션 루프 오류: {e}")
+                await self._sleep_interruptible(3600)  # 오류 시 1시간 후 재시도
 
     # ── 루프 6: 매크로 데이터 갱신 ─────────────────────────────────
 
     async def _macro_refresh_loop(self) -> None:
         """매크로 경제 데이터를 주기적으로 갱신한다 (30분 주기)."""
-        while self._state.state != BotState.HALTED:
+        # [버그3] _halt_event 기반 조건
+        while not self._halt_event.is_set():
             try:
-                await asyncio.sleep(1800)  # 30분마다
+                await self._sleep_interruptible(1800)  # 30분마다
 
                 self._macro_snapshot = await self._macro_collector.get_snapshot()
                 logger.info(f"[매크로] 갱신 완료: {self._macro_snapshot.summary()}")
@@ -575,19 +807,20 @@ class BotEngine:
                 break
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.warning(f"매크로 데이터 갱신 실패 (네트워크): {e}")
-                await asyncio.sleep(300)
+                await self._sleep_interruptible(300)
             except (KeyError, ValueError) as e:
                 logger.warning(f"매크로 데이터 갱신 실패 (파싱): {e}")
-                await asyncio.sleep(300)
+                await self._sleep_interruptible(300)
 
     # ── [고도화] 루프 7: 뉴스 감시 ─────────────────────────────────
 
     async def _news_watch_loop(self) -> None:
         """암호화폐/지정학 뉴스 실시간 감시 (HIGH → 부분 축소, CRITICAL → 전량 청산)."""
         nw = self._params.news_watch
-        while self._state.state != BotState.HALTED:
+        # [버그3] _halt_event 기반 조건
+        while not self._halt_event.is_set():
             try:
-                await asyncio.sleep(nw.poll_interval_sec)
+                await self._sleep_interruptible(nw.poll_interval_sec)
 
                 snap = await self._news_collector.fetch_snapshot()
                 self._news_snapshot = snap
@@ -630,10 +863,10 @@ class BotEngine:
                 break
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.warning(f"뉴스 감시 루프 네트워크 오류: {e}")
-                await asyncio.sleep(60)
+                await self._sleep_interruptible(60)
             except (KeyError, ValueError, TypeError) as e:
                 logger.warning(f"뉴스 감시 루프 데이터 오류: {e}")
-                await asyncio.sleep(60)
+                await self._sleep_interruptible(60)
 
     # ── [고도화] 루프 8: 변동성 스파이크 감시 ──────────────────────
 
@@ -641,9 +874,10 @@ class BotEngine:
         """모든 심볼의 최단 타임프레임 캔들에서 변동성 급증을 감지해 즉시 청산."""
         vs = self._params.vol_spike
         check_interval = max(15, self._s.trading.position_monitor_interval_sec)
-        while self._state.state != BotState.HALTED:
+        # [버그3] _halt_event 기반 조건
+        while not self._halt_event.is_set():
             try:
-                await asyncio.sleep(check_interval)
+                await self._sleep_interruptible(check_interval)
 
                 for symbol in self._market.symbols:
                     if not self._market.is_ready(symbol=symbol):
@@ -656,6 +890,14 @@ class BotEngine:
                     result = self._spike_detector.detect(df)
                     if not result.is_spike:
                         continue
+
+                    # ── 중복 트리거 방지: 같은 캔들에서 반복 감지 시 스킵 ──
+                    latest_candle_ts = df.index[-1] if not df.empty else None
+                    last_ts = self._last_spike_candle_ts.get(symbol)
+                    if latest_candle_ts is not None and latest_candle_ts == last_ts:
+                        # 이미 이 캔들에서 스파이크 처리 완료 — 중복 스킵
+                        continue
+                    self._last_spike_candle_ts[symbol] = latest_candle_ts
 
                     sym_tag = symbol.split("/")[0]
                     logger.warning(f"[{sym_tag}] 변동성 스파이크: {result.summary()}")
@@ -688,19 +930,20 @@ class BotEngine:
                 break
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.warning(f"스파이크 감시 네트워크 오류: {e}")
-                await asyncio.sleep(30)
+                await self._sleep_interruptible(30)
             except (KeyError, ValueError, TypeError) as e:
                 logger.warning(f"스파이크 감시 데이터 오류: {e}")
-                await asyncio.sleep(30)
+                await self._sleep_interruptible(30)
 
     # ── [고도화] 루프 9: 예정 이벤트 선제 대응 ─────────────────────
 
     async def _event_action_loop(self) -> None:
         """예정된 고영향 경제 이벤트 N시간 전부터 단계적으로 포지션을 축소/청산."""
         ea = self._params.event_action
-        while self._state.state != BotState.HALTED:
+        # [버그3] _halt_event 기반 조건
+        while not self._halt_event.is_set():
             try:
-                await asyncio.sleep(300)  # 5분마다 체크
+                await self._sleep_interruptible(300)  # 5분마다 체크
 
                 snap = self._macro_snapshot
                 if snap is None or not snap.events:
@@ -745,10 +988,10 @@ class BotEngine:
                 break
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.warning(f"이벤트 대응 루프 네트워크 오류: {e}")
-                await asyncio.sleep(120)
+                await self._sleep_interruptible(120)
             except (KeyError, ValueError, TypeError, AttributeError) as e:
                 logger.warning(f"이벤트 대응 루프 데이터 오류: {e}")
-                await asyncio.sleep(120)
+                await self._sleep_interruptible(120)
 
     # ── [고도화] 공통 헬퍼: 강제 축소 / 청산 / 진입 일시정지 ──────
 
@@ -806,11 +1049,14 @@ class BotEngine:
         self._pause_entries_until(target, reason)
 
     def _pause_entries_until(self, until: datetime, reason: str) -> None:
+        already_paused = self._pause_until is not None and self._pause_until > datetime.now(timezone.utc)
         if self._pause_until is None or until > self._pause_until:
             self._pause_until = until
         if not self._state.is_paused and not self._state.is_halted:
             self._state.pause_for_event(reason)
-        logger.info(f"신규 진입 일시정지: {until.strftime('%Y-%m-%d %H:%M UTC')} ({reason})")
+        # 이미 해당 이유로 pause 중이면 로그 중복 출력 방지
+        if not already_paused:
+            logger.info(f"신규 진입 일시정지: {until.strftime('%Y-%m-%d %H:%M UTC')} ({reason})")
 
     # ── [Watchdog] 시그널 루프 생존 감시 ─────────────────────────────
 
@@ -819,9 +1065,12 @@ class BotEngine:
         WATCHDOG_TIMEOUT_MINUTES = 10
         CHECK_INTERVAL_SEC = 60  # 1분마다 체크
 
-        while self._state.state != BotState.HALTED:
+        # [버그3] _halt_event 기반 조건
+        while not self._halt_event.is_set():
             try:
-                await asyncio.sleep(CHECK_INTERVAL_SEC)
+                await self._sleep_interruptible(CHECK_INTERVAL_SEC)
+                if self._halt_event.is_set():
+                    break
 
                 if self._last_signal_check is None:
                     # 봇 시작 직후 — 아직 첫 체크 전
@@ -856,6 +1105,19 @@ class BotEngine:
             except Exception as e:
                 logger.error(f"[Watchdog] 루프 오류: {e}")
 
+    # ── [버그3] HALT 인터럽트 가능한 sleep 헬퍼 ─────────────────────
+
+    async def _sleep_interruptible(self, seconds: float) -> None:
+        """_halt_event가 set되면 sleep을 즉시 중단하고 반환한다.
+
+        일반 asyncio.sleep 대신 이 함수를 사용하면 HALT 신호 수신 시
+        최대 수십ms 내로 루프를 탈출할 수 있다.
+        """
+        try:
+            await asyncio.wait_for(self._halt_event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass  # 정상적으로 시간이 경과한 경우
+
     async def _maybe_send_loop_error_alert(self, loop_name: str, error_msg: str) -> None:
         """루프에서 에러가 반복될 때 텔레그램 알림을 발송한다.
 
@@ -888,12 +1150,113 @@ class BotEngine:
         except Exception as e:
             logger.error(f"루프 에러 알림 전송 실패: {e}")
 
+    # ── [버그1] 시작 시 포지션 Reconciliation ────────────────────────
+
+    async def _reconcile_positions(self) -> None:
+        """봇 시작 시 OKX 실제 포지션과 DB를 비교해 불일치를 감지·복구한다.
+
+        - DB에 없는데 거래소에 있음 → DB에 orphan 포지션으로 추가
+        - DB에 있는데 거래소에 없음 → DB에서 CLOSED 처리 (유령 포지션)
+        - 불일치 발생 시 텔레그램 알림 발송
+        """
+        logger.info("[Reconcile] 포지션 정합성 확인 시작...")
+        symbols = self._s.trading.symbol_list
+        discrepancies: list[str] = []
+
+        try:
+            db_open_trades = await self._db.fetch_open_trades()
+            # DB 포지션 인덱스: (symbol, direction) → TradeRecord
+            db_index: dict[tuple[str, str], "TradeRecord"] = {
+                (t.symbol, t.direction): t for t in db_open_trades
+            }
+
+            # 거래소에서 전체 포지션 조회
+            exchange_positions: dict[tuple[str, str], dict] = {}
+            for symbol in symbols:
+                try:
+                    okx_pos_list = await self._orders._rest.fetch_positions(symbol)
+                    for pos in okx_pos_list:
+                        side = pos.get("side", "")
+                        direction = "LONG" if side == "long" else "SHORT" if side == "short" else None
+                        if direction and float(pos.get("contracts", 0) or 0) > 0:
+                            exchange_positions[(symbol, direction)] = pos
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    logger.warning(f"[Reconcile] {symbol} 포지션 조회 실패 (스킵): {e}")
+
+            # 1) DB에 있는데 거래소에 없음 → 유령 포지션 → DB closed 처리
+            for (symbol, direction), trade in db_index.items():
+                if (symbol, direction) not in exchange_positions:
+                    sym_tag = symbol.split("/")[0]
+                    msg = (
+                        f"[{sym_tag}] 유령 포지션 감지: DB에 OPEN이지만 거래소에 없음 "
+                        f"({trade.trade_id} {direction}) → DB를 CLOSED로 마감"
+                    )
+                    logger.warning(msg)
+                    discrepancies.append(f"🔴 유령포지션 마감: {sym_tag} {direction} ({trade.trade_id})")
+                    trade.status = "CLOSED"
+                    trade.exit_time = datetime.now(timezone.utc).isoformat()
+                    trade.exit_reason = "RECONCILE_GHOST"
+                    await self._db.update_trade(trade)
+
+            # 2) 거래소에 있는데 DB에 없음 → 고아 포지션 → DB에 추가
+            from database.models import TradeRecord as TR
+            for (symbol, direction), pos in exchange_positions.items():
+                if (symbol, direction) not in db_index:
+                    sym_tag = symbol.split("/")[0]
+                    contracts = float(pos.get("contracts", 0) or 0)
+                    avg_price = float(pos.get("entryPrice") or pos.get("info", {}).get("avgPx") or 0)
+                    msg = (
+                        f"[{sym_tag}] 고아 포지션 감지: 거래소에 있는데 DB에 없음 "
+                        f"({direction} qty={contracts:.4f} entry=${avg_price:,.2f}) → DB에 복구"
+                    )
+                    logger.warning(msg)
+                    discrepancies.append(
+                        f"🟡 고아포지션 복구: {sym_tag} {direction} "
+                        f"qty={contracts:.4f} @ ${avg_price:,.2f}"
+                    )
+                    orphan_trade = TR(
+                        symbol=symbol,
+                        direction=direction,
+                        quantity=contracts,
+                        leverage=self._s.trading.leverage,
+                        entry_price=avg_price,
+                        entry_time=datetime.now(timezone.utc).isoformat(),
+                        signal_confidence=0.0,
+                        atr_at_entry=0.0,
+                    )
+                    await self._db.insert_trade(orphan_trade)
+
+            if discrepancies:
+                summary = "\n".join(discrepancies)
+                logger.warning(f"[Reconcile] 불일치 {len(discrepancies)}건 발견 및 처리 완료")
+                await self._notifier.on_alert(
+                    "WARNING",
+                    (
+                        f"⚠️ <b>[포지션 불일치 감지]</b> — 봇 시작 시 복구 완료\n"
+                        f"{summary}\n"
+                        f"<i>이전 세션에서 청산 실패 또는 외부 개입이 있었을 수 있습니다.</i>"
+                    ),
+                )
+                await self._db.log_event(BotEvent(
+                    event_type="RECONCILE",
+                    level="WARNING",
+                    message=f"포지션 불일치 {len(discrepancies)}건 복구",
+                    metadata={"items": discrepancies},
+                ))
+            else:
+                logger.info("[Reconcile] 포지션 정합성 확인 완료 — 불일치 없음")
+
+        except Exception as e:
+            logger.error(f"[Reconcile] 포지션 정합성 확인 중 오류 (봇 시작 계속): {e}")
+
     # ── 긴급 정지 ────────────────────────────────────────────────
 
     async def _halt(self, reason: str) -> None:
         """봇 긴급 정지. 모든 포지션을 강제 청산한다."""
         logger.critical(f"봇 긴급 정지: {reason}")
         self._state.halt(reason)
+        # [버그3] HALT 이벤트 즉시 발동 — 모든 루프가 다음 await에서 바로 탈출한다
+        self._halt_event.set()
         await push_sse_event("state", {"state": "HALTED", "reason": reason})
         await self._notifier.on_halt(reason)
 

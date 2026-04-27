@@ -5,7 +5,7 @@ SQLite DB 관리자 (aiosqlite 기반 비동기).
 import json
 import os
 import stat
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -21,8 +21,13 @@ from database.models import (
 )
 
 
+# KST = UTC+9. 일일 손실 한도는 한국 시간 자정(00:00 KST) 기준으로 리셋된다.
+_KST = timezone(timedelta(hours=9))
+
+
 def _today() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    """오늘 날짜를 KST(UTC+9) 기준으로 반환한다. (YYYY-MM-DD)"""
+    return datetime.now(_KST).strftime("%Y-%m-%d")
 
 
 class DatabaseManager:
@@ -63,17 +68,29 @@ class DatabaseManager:
         await self._conn.executescript(sql)
         await self._conn.commit()
 
-        # 002+: ALTER 계열은 실패 시 무시 (이미 적용된 컬럼)
+        # 002+: executescript로 전체 SQL 실행 (CREATE IF NOT EXISTS는 idempotent,
+        # ALTER 재실행은 OperationalError를 try/except로 무시)
         for mig in sorted(migrations_dir.glob("0*.sql")):
             if mig.name.startswith("001_"):
                 continue
-            stmts = [s.strip() for s in mig.read_text(encoding="utf-8").split(";") if s.strip() and not s.strip().startswith("--")]
-            for stmt in stmts:
+            sql_text = mig.read_text(encoding="utf-8")
+            try:
+                await self._conn.executescript(sql_text)
+                await self._conn.commit()
+            except aiosqlite.OperationalError as e:
+                logger.debug(f"마이그레이션 {mig.name} 스킵 (이미 적용됨): {e}")
+                # ALTER 등 일부 statement만 실패한 경우, 트랜잭션 롤백 후 statement 단위로 재시도
                 try:
-                    await self._conn.execute(stmt)
-                except aiosqlite.OperationalError as e:
-                    logger.debug(f"마이그레이션 {mig.name} 스킵: {e}")
-            await self._conn.commit()
+                    await self._conn.rollback()
+                except aiosqlite.Error:
+                    pass
+                stmts = [s.strip() for s in sql_text.split(";") if s.strip() and not s.strip().startswith("--")]
+                for stmt in stmts:
+                    try:
+                        await self._conn.execute(stmt)
+                    except aiosqlite.OperationalError as inner_e:
+                        logger.debug(f"마이그레이션 {mig.name} statement 스킵: {inner_e}")
+                await self._conn.commit()
 
     async def close(self) -> None:
         if self._conn:
@@ -253,7 +270,7 @@ class DatabaseManager:
     # ── 통계 조회 ────────────────────────────────────────────────
 
     async def fetch_trade_stats(self) -> dict:
-        """전체 거래 통계 요약"""
+        """전체 기간 거래 통계 요약 (누적)"""
         sql = """
         SELECT
             COUNT(*) AS total,
@@ -271,6 +288,224 @@ class DatabaseManager:
         async with self._conn.execute(sql) as cur:
             row = await cur.fetchone()
             return dict(row) if row else {}
+
+    async def fetch_trade_stats_for_date(self, date_str: Optional[str] = None) -> dict:
+        """특정 KST 날짜의 거래 통계 요약.
+
+        date_str: 'YYYY-MM-DD' (KST 기준). None이면 오늘(KST).
+        exit_time은 UTC ISO 문자열로 저장되므로, KST 날짜 → UTC 범위로 변환해 필터링한다.
+        KST 자정 00:00 = UTC 전날 15:00
+        """
+        date_str = date_str or _today()
+        # KST 날짜 → UTC 범위
+        from datetime import date as _date_type
+        kst_date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=_KST)
+        utc_start = (kst_date).astimezone(timezone.utc)
+        utc_end = (kst_date + timedelta(days=1)).astimezone(timezone.utc)
+        utc_start_str = utc_start.strftime("%Y-%m-%dT%H:%M:%S")
+        utc_end_str = utc_end.strftime("%Y-%m-%dT%H:%M:%S")
+
+        sql = """
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END) AS wins,
+            SUM(CASE WHEN pnl_usdt <= 0 THEN 1 ELSE 0 END) AS losses,
+            SUM(pnl_usdt) AS total_pnl,
+            AVG(CASE WHEN pnl_usdt > 0 THEN pnl_usdt END) AS avg_win,
+            AVG(CASE WHEN pnl_usdt <= 0 THEN pnl_usdt END) AS avg_loss,
+            AVG(CASE WHEN pnl_pct > 0 THEN pnl_pct END) AS avg_win_pct,
+            AVG(CASE WHEN pnl_pct <= 0 THEN pnl_pct END) AS avg_loss_pct,
+            MAX(pnl_usdt) AS best_trade,
+            MIN(pnl_usdt) AS worst_trade
+        FROM trades
+        WHERE status = 'CLOSED'
+          AND exit_time >= ?
+          AND exit_time < ?
+        """
+        async with self._conn.execute(sql, (utc_start_str, utc_end_str)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else {}
+
+    # ── 월간 메트릭 (CAPR 목표 추적) ────────────────────────────
+
+    async def get_or_init_monthly_metric(
+        self,
+        month_str: str,
+        start_equity: float,
+        target_pct: float,
+    ) -> dict:
+        """월간 메트릭을 조회하거나, 없으면 초기화해 반환한다.
+
+        month_str: 'YYYY-MM' (KST)
+        start_equity: 월 첫날 시작 자산
+        target_pct: 해당 월 목표 수익률
+        """
+        async with self._conn.execute(
+            "SELECT * FROM monthly_metrics WHERE month = ?", (month_str,)
+        ) as cur:
+            row = await cur.fetchone()
+            if row:
+                return dict(row)
+
+        # 신규 월 초기화
+        await self._conn.execute(
+            """INSERT OR IGNORE INTO monthly_metrics
+               (month, start_equity, end_equity, pnl_usdt, trade_count, win_count,
+                target_pct, actual_pct, goal_achieved, updated_at)
+               VALUES (?, ?, ?, 0, 0, 0, ?, 0, 0, datetime('now'))""",
+            (month_str, start_equity, start_equity, target_pct),
+        )
+        await self._conn.commit()
+        return {
+            "month": month_str,
+            "start_equity": start_equity,
+            "end_equity": start_equity,
+            "pnl_usdt": 0.0,
+            "trade_count": 0,
+            "win_count": 0,
+            "target_pct": target_pct,
+            "actual_pct": 0.0,
+            "goal_achieved": 0,
+        }
+
+    async def update_monthly_metric(
+        self,
+        month_str: str,
+        end_equity: float,
+        daily_pnl: float,
+        daily_trades: int,
+        daily_wins: int,
+        daily_best: Optional[float] = None,
+        daily_worst: Optional[float] = None,
+    ) -> None:
+        """월간 메트릭을 업데이트한다 (매일 KST 자정 호출)."""
+        async with self._conn.execute(
+            "SELECT * FROM monthly_metrics WHERE month = ?", (month_str,)
+        ) as cur:
+            row = await cur.fetchone()
+            if not row:
+                return
+            m = dict(row)
+
+        start_eq = m.get("start_equity") or end_equity
+        actual_pct = (end_equity - start_eq) / start_eq if start_eq > 0 else 0.0
+        target_pct = m.get("target_pct") or 0.0
+        goal_achieved = 1 if actual_pct >= target_pct else 0
+
+        new_best = max(filter(None, [m.get("best_day_pnl"), daily_best or daily_pnl or 0]))
+        new_worst = min(filter(None, [m.get("worst_day_pnl"), daily_worst or daily_pnl or 0]))
+
+        await self._conn.execute(
+            """UPDATE monthly_metrics SET
+               end_equity    = ?,
+               pnl_usdt      = pnl_usdt + ?,
+               trade_count   = trade_count + ?,
+               win_count     = win_count + ?,
+               best_day_pnl  = ?,
+               worst_day_pnl = ?,
+               actual_pct    = ?,
+               goal_achieved = ?,
+               updated_at    = datetime('now')
+             WHERE month = ?""",
+            (
+                end_equity,
+                daily_pnl,
+                daily_trades,
+                daily_wins,
+                new_best,
+                new_worst,
+                actual_pct,
+                goal_achieved,
+                month_str,
+            ),
+        )
+        await self._conn.commit()
+
+    async def fetch_monthly_metrics(self, limit: int = 12) -> list[dict]:
+        """최근 N개월 메트릭을 최신순으로 반환한다."""
+        async with self._conn.execute(
+            "SELECT * FROM monthly_metrics ORDER BY month DESC LIMIT ?", (limit,)
+        ) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def fetch_portfolio_stats(
+        self,
+        initial_capital: float,
+        start_date: Optional[str] = None,
+    ) -> dict:
+        """포트폴리오 전체 통계 (누적 수익률, CAGR 추정, 승월/패월 등).
+
+        initial_capital: .env의 GOAL_INITIAL_CAPITAL
+        start_date: 'YYYY-MM-DD' — None이면 최초 equity_snapshot 날짜 사용
+        """
+        # 최신 자산
+        async with self._conn.execute(
+            "SELECT equity FROM equity_snapshots ORDER BY created_at DESC LIMIT 1"
+        ) as cur:
+            row = await cur.fetchone()
+            current_equity = float(row[0]) if row else initial_capital
+
+        # 시작일 결정
+        if not start_date:
+            async with self._conn.execute(
+                "SELECT MIN(created_at) FROM equity_snapshots"
+            ) as cur:
+                row = await cur.fetchone()
+                start_date = (row[0] or "")[:10] if row else _today()
+
+        # 경과 일수
+        try:
+            d0 = datetime.strptime(start_date, "%Y-%m-%d")
+            elapsed_days = max((datetime.now() - d0).days, 1)
+        except ValueError:
+            elapsed_days = 1
+
+        cumulative_return = (current_equity - initial_capital) / initial_capital
+        years = elapsed_days / 365.25
+        try:
+            cagr = (current_equity / initial_capital) ** (1 / years) - 1 if years > 0 else 0.0
+        except (ZeroDivisionError, ValueError):
+            cagr = 0.0
+
+        # 월간 메트릭 집계
+        monthly = await self.fetch_monthly_metrics(limit=24)
+        win_months = sum(1 for m in monthly if (m.get("actual_pct") or 0) > 0)
+        loss_months = sum(1 for m in monthly if (m.get("actual_pct") or 0) < 0)
+        achieved_months = sum(1 for m in monthly if m.get("goal_achieved") == 1)
+
+        return {
+            "initial_capital": initial_capital,
+            "current_equity": current_equity,
+            "cumulative_return": cumulative_return,
+            "cagr": cagr,
+            "elapsed_days": elapsed_days,
+            "start_date": start_date,
+            "win_months": win_months,
+            "loss_months": loss_months,
+            "achieved_months": achieved_months,
+            "total_months": len(monthly),
+        }
+
+    # ── 포트폴리오 이정표 ─────────────────────────────────────────
+
+    async def get_hit_milestones(self) -> list[float]:
+        """이미 달성한 이정표 수익률 목록을 반환한다."""
+        async with self._conn.execute(
+            "SELECT milestone_pct FROM portfolio_milestones ORDER BY milestone_pct"
+        ) as cur:
+            rows = await cur.fetchall()
+            return [float(r[0]) for r in rows]
+
+    async def record_milestone(self, milestone_pct: float, equity: float) -> None:
+        """새 이정표를 기록한다 (중복 방지)."""
+        await self._conn.execute(
+            """INSERT OR IGNORE INTO portfolio_milestones
+               (milestone_pct, equity_at_hit, achieved_at)
+               VALUES (?, ?, datetime('now'))""",
+            (milestone_pct, equity),
+        )
+        await self._conn.commit()
 
     async def fetch_consecutive_losses(self) -> int:
         """최근 연속 손실 횟수를 반환한다."""

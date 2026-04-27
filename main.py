@@ -84,14 +84,17 @@ async def run_bot() -> None:
     params = AllStrategyParams.from_yaml()
     aggregator = SignalAggregator(params)
 
-    # 리스크
-    risk_mgr = RiskManager(settings.trading, settings.risk, db)
+    # 리스크 + 목표 추적
+    notifier_pre = NotificationManager(settings)  # GoalTracker 주입용 (아래에서 재사용)
+    from risk.goal_tracker import GoalTracker
+    goal_tracker = GoalTracker(db, settings.goal, notifier_pre)
+    risk_mgr = RiskManager(settings.trading, settings.risk, db, goal_tracker=goal_tracker)
     stop_mgr = StopManager(params.risk)
 
     # 실행
     order_mgr = OrderManager(rest, settings.trading)
     tracker = PositionTracker(rest, db, settings.trading)
-    notifier = NotificationManager(settings)
+    notifier = notifier_pre  # 위에서 이미 생성
     lifecycle = TradeLifecycle(order_mgr, stop_mgr, db, notifier, settings.trading, risk_params=params.risk)
 
     # 봇 엔진 (params 공유로 뉴스/스파이크/이벤트/자동복구 활성화)

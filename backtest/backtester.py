@@ -69,7 +69,13 @@ class Backtester:
         self._momentum = MomentumTrigger(params.momentum)
         self._micro = MicroConfirmation(params.micro)
 
-        self._regime_detector = RegimeDetector()
+        self._regime_detector = RegimeDetector(
+            adx_trending_threshold=params.regime.adx_trending_threshold,
+            adx_ranging_threshold=params.regime.adx_ranging_threshold,
+            bb_bandwidth_low=params.regime.bb_bandwidth_low,
+            bb_bandwidth_high=params.regime.bb_bandwidth_high,
+            atr_pct_volatile=params.regime.atr_pct_volatile,
+        )
         # Debug counters
         self._debug_counts = {"layer1_neutral": 0, "layer1_pass": 0, "layer2_fail": 0, "layer3_fail": 0, "regime_block": 0, "signal_pass": 0}
 
@@ -133,6 +139,10 @@ class Backtester:
             result.append(d)
         return result
 
+    def get_debug_counts(self) -> dict:
+        """레이어별 통과/차단 카운트 반환 (게이트 진단용)"""
+        return dict(self._debug_counts)
+
     def _evaluate_signal(
         self,
         df_4h: pd.DataFrame,
@@ -164,8 +174,8 @@ class Backtester:
         regime_result = self._regime_detector.detect(slice_4h)
         regime_tag = regime_result.regime if regime_result else "UNKNOWN"
 
-        # RANGING 시장에서 진입 차단 (라이브 동일)
-        if regime_result and regime_result.is_ranging:
+        # RANGING 시장에서 진입 차단 (라이브 동일: block_ranging 설정 존중)
+        if regime_result and regime_result.is_ranging and self._params.regime.block_ranging:
             self._debug_counts["regime_block"] += 1
             return None
 

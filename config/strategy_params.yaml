@@ -10,10 +10,43 @@ symbol_settings:
   BTC/USDT:USDT:
     qty_precision: 4
     min_qty: 0.001
+  ETH/USDT:USDT:
+    qty_precision: 3
+    min_qty: 0.01
   GMT/USDT:USDT:
     qty_precision: 1
     min_qty: 0.1
   SUI/USDT:USDT:
+    qty_precision: 1
+    min_qty: 0.1
+  EGLD/USDT:USDT:
+    qty_precision: 2
+    min_qty: 0.01
+  DOT/USDT:USDT:
+    qty_precision: 1
+    min_qty: 0.1
+  ALGO/USDT:USDT:
+    qty_precision: 1
+    min_qty: 1.0
+  AVAX/USDT:USDT:
+    qty_precision: 2
+    min_qty: 0.01
+  SOL/USDT:USDT:
+    qty_precision: 2
+    min_qty: 0.01
+  LINK/USDT:USDT:
+    qty_precision: 1
+    min_qty: 0.1
+  ARB/USDT:USDT:
+    qty_precision: 1
+    min_qty: 0.1
+  INJ/USDT:USDT:
+    qty_precision: 2
+    min_qty: 0.01
+  TIA/USDT:USDT:
+    qty_precision: 1
+    min_qty: 0.1
+  WIF/USDT:USDT:
     qty_precision: 1
     min_qty: 0.1
 
@@ -177,6 +210,31 @@ walk_forward:
 # 최소 거래 수 기준 (과적합 방지)
 min_trades: 15               # 초기 탐색용 (기존 24 → 15)
 
+# ── ML 백테스트 v1 (BTC 1m + LightGBM 회귀) ──
+# scripts/fetch_btc_history.py → strategy/ml_features.py → strategy/ml_model.py
+# → backtest/ml_backtester.py 흐름에서 사용. 룰베이스 backtest 와 별개.
+ml_backtest:
+  symbol: "BTC/USDT:USDT"
+  timeframe: "1m"
+  data_dir: "data_cache/ohlcv_1m/BTC-USDT-SWAP"
+  feature_dir: "features/btc_1m_v1"
+  model_dir: "models/btc_lgb_v1"
+  results_dir: "backtest/results/btc_ml_v1"
+  primary_target_horizon: 15        # 분 단위 forward log return 예측
+  threshold_quantile: 0.75          # 학습 fold 예측 분포의 75% percentile → long/short
+  initial_balance: 1000.0
+  leverage: 5
+  position_pct: 0.10                # 잔고의 10%를 명목 노출량으로
+  fee_pct: 0.0005                   # OKX taker
+  slippage_pct: 0.0005              # 1m 빈번 flip 고려 0.05%/side (룰베이스보다 보수적)
+  funding_per_8h_pct: 0.0001        # 0.01% per 8h 상수 가정 (v2: 실제 funding history)
+  max_hold_bars: 60                 # 1시간 timeout
+  walk_forward:
+    train_window_months: 18
+    train_window_max_months: 36
+    test_window_months: 1
+    embargo_minutes: 60
+
 # ── 백테스팅 전용 파라미터 (라이브와 분리) ──
 backtest:
   signal_mode: "OR"              # "AND" (엄격) / "OR" (완화) / "SCORE_ONLY" (스코어만)  # [수정] 라이브와 통일 (기존: "AND")
@@ -246,3 +304,111 @@ auto_resume:
   min_halt_minutes: 120           # 최소 2시간은 정지 유지
   recovery_drawdown_pct: 0.08     # 드로다운이 8% 이하로 내려와야 복구
   max_auto_resumes_per_day: 1     # 하루 최대 1회 자동 복구
+
+# ============================================================
+# [10x 목표] 1년 10배 전략 파라미터
+# 목표: $1,096 → $10,960 (12개월, 월 21.44% 복리)
+# 근거: 10^(1/12) - 1 = 0.2144
+# 심볼: 고베타 알트코인 (AVAX, SOL, SUI, LINK, ARB, INJ 등)
+# ============================================================
+x10_goal:
+  # 재무 목표
+  initial_capital: 1096.0          # 시작 자본 (USDT)
+  target_capital: 10960.0          # 12개월 목표 자본
+  monthly_target_pct: 0.2144       # 월 21.44% (복리 10x)
+  start_date: "2026-04-24"
+
+  # 3가지 시나리오 설정
+  scenarios:
+    conservative:                   # 시나리오 A: 보수적 (3x, 10% 포지션)
+      leverage: 3
+      max_position_pct: 0.10
+      atr_sl_multiplier: 1.5
+      atr_tp1_multiplier: 2.0
+      atr_tp2_multiplier: 3.5
+      signal_mode: "OR"
+      max_trade_duration_hours: 48
+      monthly_target_pct: 0.10     # 월 10% 목표 (보수)
+
+    balanced:                       # 시나리오 B: 균형 (5x, 12% 포지션)
+      leverage: 5
+      max_position_pct: 0.12
+      atr_sl_multiplier: 1.5
+      atr_tp1_multiplier: 2.0
+      atr_tp2_multiplier: 4.5
+      signal_mode: "OR"
+      max_trade_duration_hours: 72
+      monthly_target_pct: 0.15     # 월 15% 목표 (중간)
+
+    aggressive:                     # 시나리오 C: 공격적 (5x, 15% 포지션)
+      leverage: 5
+      max_position_pct: 0.15
+      atr_sl_multiplier: 1.5
+      atr_tp1_multiplier: 2.0
+      atr_tp2_multiplier: 5.0
+      signal_mode: "AND"
+      max_trade_duration_hours: 96
+      monthly_target_pct: 0.2144   # 월 21.44% 목표 (10x 달성)
+
+  # 심볼 목록 (고베타 알트코인 — BTC 대비 베타 높음)
+  symbols:
+    - "AVAX/USDT:USDT"   # 높은 베타, 유동성 충분
+    - "SOL/USDT:USDT"    # 생태계 성장, 높은 변동성
+    - "SUI/USDT:USDT"    # 신규 L1, 고베타
+    - "LINK/USDT:USDT"   # 오라클 섹터 리더, 추세 추종 특성
+    - "ARB/USDT:USDT"    # L2 대표, 기술적 분석 적합
+    - "INJ/USDT:USDT"    # DeFi 고베타
+
+  # 심볼 로테이션 설정 (weekly momentum-based rotation)
+  symbol_rotation:
+    enabled: true
+    rotation_interval_hours: 168   # 주 1회 (7일)
+    top_n_symbols: 3               # 상위 3개 심볼 선택
+    candidate_pool:                # 선발 풀 (랭킹에서 선택)
+      - "AVAX/USDT:USDT"
+      - "SOL/USDT:USDT"
+      - "SUI/USDT:USDT"
+      - "LINK/USDT:USDT"
+      - "ARB/USDT:USDT"
+      - "INJ/USDT:USDT"
+      - "TIA/USDT:USDT"
+      - "WIF/USDT:USDT"
+
+  # 월별 목표 달성 스케줄 (복리 기반)
+  # equity_schedule[n] = 1096 * 1.2144^n
+  monthly_equity_schedule:
+    - month: 1
+      target_equity: 1330.16     # +21.44%
+    - month: 2
+      target_equity: 1615.27     # +21.44%
+    - month: 3
+      target_equity: 1960.90     # +21.44%
+    - month: 4
+      target_equity: 2380.67     # +21.44%
+    - month: 5
+      target_equity: 2889.87     # +21.44%
+    - month: 6
+      target_equity: 3507.98     # +21.44%
+    - month: 7
+      target_equity: 4258.10     # +21.44%
+    - month: 8
+      target_equity: 5168.61     # +21.44%
+    - month: 9
+      target_equity: 6276.05     # +21.44%
+    - month: 10
+      target_equity: 7619.44     # +21.44%
+    - month: 11
+      target_equity: 9248.38     # +21.44%
+    - month: 12
+      target_equity: 11228.08    # +21.44% (목표 $10,960 초과 달성)
+
+  # 단계별 Kelly 스케일 팩터 (GoalTracker에서 사용)
+  # AHEAD: 월 목표 대비 120% 이상 달성 → 수익 보호 모드
+  # ON_PACE: 80~120% 달성 → 정상 운영
+  # BEHIND: 50~79% 달성 → 약간 공격적
+  # CHASE: 50% 미만 달성 + 월말 10일 이내 → 공격적 (리스크 증가)
+  phase_kelly_scales:
+    AHEAD: 0.60          # 수익 보호: 포지션 40% 축소
+    ON_PACE: 1.0         # 정상: Kelly 그대로
+    BEHIND: 1.15         # 약간 공격: 15% 증대
+    CHASE: 1.30          # 추격: 30% 증대 (위험, 월말 한정)

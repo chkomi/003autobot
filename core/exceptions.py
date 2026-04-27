@@ -112,6 +112,22 @@ class OrderNotFoundError(OrderError):
         self.order_id = order_id
 
 
+class ClosePositionFailedError(OrderError):
+    """청산 주문 최대 재시도 후 전량 실패 — 거래소 포지션 수동 확인 필요.
+
+    fallback_price: 내부 P&L 계산에 사용할 현재가 폴백 값.
+    거래소에 포지션이 여전히 열려있을 수 있으므로 반드시 텔레그램 긴급 알림 발송 필요.
+    """
+    def __init__(self, symbol: str, trade_id: str, fallback_price: float):
+        super().__init__(
+            f"청산 완전 실패 ({symbol} / {trade_id}): 거래소 포지션이 아직 열려있을 수 있음 "
+            f"— 폴백 가격 ${fallback_price:,.2f} 적용"
+        )
+        self.fallback_price = fallback_price
+        self.symbol = symbol
+        self.trade_id = trade_id
+
+
 class PositionError(BotError):
     """포지션 조회/관리 오류"""
     pass

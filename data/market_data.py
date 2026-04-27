@@ -112,3 +112,25 @@ class MarketData:
                 if not self._store.has_enough(sym, tf, min_req):
                     return False
         return True
+
+    def update_symbols(self, new_symbols: List[str]) -> None:
+        """활성 심볼 목록을 교체한다 (주간 로테이션 등에서 호출)."""
+        old = set(self._symbols)
+        new = set(new_symbols)
+        added = new - old
+        removed = old - new
+        self._symbols = list(new_symbols)
+        if added or removed:
+            logger.info(
+                f"[MarketData] 심볼 업데이트: +"
+                f"{', '.join(s.split('/')[0] for s in added) or '-'} / "
+                f"-{', '.join(s.split('/')[0] for s in removed) or '-'}"
+            )
+
+    async def warm_up_symbols(self, symbols: List[str]) -> None:
+        """지정 심볼들의 모든 타임프레임 캔들을 로딩한다 (신규 심볼 진입 시)."""
+        for symbol in symbols:
+            for tf in self._config.all_timeframes:
+                await self.refresh_candles(tf, symbol=symbol)
+                count = self._store.count(symbol, tf)
+                logger.info(f"[MarketData] 신규 심볼 캔들 로딩: {symbol} {tf} — {count}개")

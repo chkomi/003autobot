@@ -259,7 +259,7 @@ class SignalAggregator:
             sp = self._params.scoring
             if score_result.total < sp.weak_signal_threshold:
                 logger.info(
-                    f"스코어 미달 ({score_result.total:.1f} < {sp.weak_signal_threshold}) — 진입 거부"
+                    f"🔍 [{sym_tag}] 스코어 미달 ({score_result.total:.1f} < {sp.weak_signal_threshold}) — 진입 거부 | {score_result.summary()}"
                 )
                 return flat
 
@@ -293,7 +293,7 @@ class SignalAggregator:
                 regime=regime_result,
             )
 
-            logger.info(f"[시그널] {signal.summary()}")
+            logger.info(f"[시그널] {signal.summary()} | {score_result.summary()}")
             return signal
 
         except (KeyError, ValueError, TypeError) as e:

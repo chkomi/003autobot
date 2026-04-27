@@ -10,11 +10,16 @@ from loguru import logger
 
 from config.settings import TradingConfig
 from config.strategy_params import RiskParams
+from core.exceptions import ClosePositionFailedError
 from database.db_manager import DatabaseManager
 from database.models import BotEvent, TradeRecord
 from execution.order_manager import OrderManager
 from notification.notification_manager import NotificationManager
 from risk.stop_manager import StopManager
+
+
+# OKX USDT 선물 테이커 수수료율 (진입+청산 각각 적용)
+_OKX_TAKER_FEE_RATE = 0.0005  # 0.05%
 
 
 class TradeLifecycle:
@@ -148,8 +153,38 @@ class TradeLifecycle:
             )
 
     async def _close(self, trade: TradeRecord, current_price: float, reason: str) -> str:
-        """전량 청산 후 DB 업데이트 및 알림"""
-        exit_price = await self._orders.close_position(trade, current_price, reason)
+        """전량 청산 후 DB 업데이트 및 알림.
+
+        [버그1] ClosePositionFailedError 발생 시 — DB 마감 전 텔레그램 긴급 알림 발송 후
+        폴백 가격으로 DB를 닫는다. 거래소에 포지션이 남아 있으므로 수동 확인 필요.
+        """
+        ghost_position = False
+        try:
+            exit_price = await self._orders.close_position(trade, current_price, reason)
+        except ClosePositionFailedError as e:
+            # 거래소 청산 완전 실패 — 긴급 텔레그램 알림 발송 후 폴백 가격으로 DB 마감
+            ghost_position = True
+            exit_price = e.fallback_price
+            sym_tag = trade.symbol.split("/")[0]
+            logger.critical(
+                f"[{sym_tag}] 유령 포지션 위험! 청산 {e} "
+                f"— DB는 ${exit_price:,.2f} 기준으로 마감"
+            )
+            try:
+                await self._notifier.on_alert(
+                    "CRITICAL",
+                    (
+                        f"🚨 <b>[긴급] 청산 주문 완전 실패</b>\n"
+                        f"심볼: <code>{trade.symbol}</code>\n"
+                        f"트레이드ID: <code>{trade.trade_id}</code>\n"
+                        f"방향: {trade.direction} | 수량: {trade.quantity:.4f}\n"
+                        f"사유: {reason}\n"
+                        f"⚠️ <b>거래소에 포지션이 아직 열려있을 수 있습니다. 즉시 수동 확인 필요!</b>\n"
+                        f"폴백 가격 ${exit_price:,.2f} 기준으로 내부 DB만 마감 처리됩니다."
+                    ),
+                )
+            except Exception as notify_err:
+                logger.error(f"긴급 알림 발송 실패: {notify_err}")
         pnl = self._calc_pnl(trade, exit_price)
 
         trade.status = "CLOSED"
@@ -157,9 +192,9 @@ class TradeLifecycle:
         trade.exit_time = datetime.now(timezone.utc).isoformat()
         trade.exit_reason = reason
         trade.pnl_usdt = pnl
-        trade.pnl_pct = (exit_price - (trade.entry_price or exit_price)) / (trade.entry_price or 1)
-        if trade.direction == "SHORT":
-            trade.pnl_pct = -trade.pnl_pct
+        # pnl_pct = 마진 대비 수익률 (레버리지 효과 반영)
+        margin = (trade.entry_price or exit_price) * (trade.quantity or 1)
+        trade.pnl_pct = pnl / margin if margin > 0 else 0.0
 
         await self._db.update_trade(trade)
         await self._db.update_daily_pnl(
@@ -167,6 +202,26 @@ class TradeLifecycle:
             is_win=pnl > 0,
         )
         await self._notifier.on_trade_closed(trade)
+
+        # 유령 포지션 경고 이벤트 DB 기록
+        if ghost_position:
+            try:
+                await self._db.log_event(BotEvent(
+                    event_type="GHOST_POSITION",
+                    level="CRITICAL",
+                    message=(
+                        f"청산 주문 완전 실패 — 거래소 포지션 수동 확인 필요: "
+                        f"{trade.trade_id} {trade.symbol} {trade.direction}"
+                    ),
+                    metadata={
+                        "trade_id": trade.trade_id,
+                        "symbol": trade.symbol,
+                        "direction": trade.direction,
+                        "fallback_price": exit_price,
+                    },
+                ))
+            except Exception as db_err:
+                logger.error(f"GHOST_POSITION 이벤트 로그 실패: {db_err}")
 
         # 추적 상태 정리
         self._tp1_hit.pop(trade.trade_id, None)
@@ -176,6 +231,7 @@ class TradeLifecycle:
         logger.info(
             f"거래 완료: {trade.trade_id} | {reason} | "
             f"P&L: {'+' if pnl >= 0 else ''}{pnl:.2f} USDT"
+            + (" [⚠️ 유령포지션 위험]" if ghost_position else "")
         )
         return reason
 
@@ -258,19 +314,35 @@ class TradeLifecycle:
             logger.warning(f"본절 이동 실패: {e}")
 
     def _calc_pnl(self, trade: TradeRecord, exit_price: float) -> float:
-        """전체 P&L 계산"""
+        """전체 P&L 계산 (OKX 테이커 수수료 차감 포함).
+
+        수수료 = 진입 노셔널 × fee_rate + 청산 노셔널 × fee_rate
+        노셔널 = 진입가 × 수량  (레버리지는 증거금 대비 배율이므로 노셔널에 포함되지 않음)
+        """
         if trade.entry_price is None:
             return 0.0
+        qty = trade.quantity or 0.0
+        lev = trade.leverage or 1
         if trade.direction == "LONG":
-            return (exit_price - trade.entry_price) * trade.quantity * trade.leverage
-        return (trade.entry_price - exit_price) * trade.quantity * trade.leverage
+            gross = (exit_price - trade.entry_price) * qty * lev
+        else:
+            gross = (trade.entry_price - exit_price) * qty * lev
+        # 수수료: 진입 시 entry_price × qty, 청산 시 exit_price × qty 각각 fee_rate
+        fee = (trade.entry_price + exit_price) * qty * _OKX_TAKER_FEE_RATE
+        return gross - fee
 
     def _calc_pnl_partial(self, trade: TradeRecord, exit_price: float, qty: float) -> float:
+        """부분 청산 P&L 계산 (OKX 테이커 수수료 차감 포함)."""
         if trade.entry_price is None:
             return 0.0
+        lev = trade.leverage or 1
         if trade.direction == "LONG":
-            return (exit_price - trade.entry_price) * qty * trade.leverage
-        return (trade.entry_price - exit_price) * qty * trade.leverage
+            gross = (exit_price - trade.entry_price) * qty * lev
+        else:
+            gross = (trade.entry_price - exit_price) * qty * lev
+        # 부분 청산분 수수료 (진입 비례 + 청산)
+        fee = (trade.entry_price + exit_price) * qty * _OKX_TAKER_FEE_RATE
+        return gross - fee
 
     # ── 외부용: 이벤트/뉴스/스파이크 대응 비상 핸들러 ──────────────
 

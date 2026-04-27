@@ -4,7 +4,7 @@
 주기적으로 실행되어 전략의 자가 개선을 지원한다.
 """
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from loguru import logger
@@ -92,20 +92,27 @@ class FeedbackLoop:
     def __init__(self, db: DatabaseManager):
         self._db = db
 
-    async def generate_daily_report(self) -> PerformanceReport:
-        """오늘의 성과 리포트를 생성한다."""
-        return await self._generate_report("daily")
+    # KST = UTC+9
+    _KST = timezone(timedelta(hours=9))
+
+    async def generate_daily_report(self, date_str: Optional[str] = None) -> PerformanceReport:
+        """오늘(또는 지정 KST 날짜)의 성과 리포트를 생성한다."""
+        date_str = date_str or datetime.now(self._KST).strftime("%Y-%m-%d")
+        return await self._generate_report("daily", date_str=date_str)
 
     async def generate_weekly_report(self) -> PerformanceReport:
-        """주간 성과 리포트를 생성한다."""
+        """주간 성과 리포트를 생성한다. (전체 누적 통계 사용)"""
         return await self._generate_report("weekly")
 
-    async def _generate_report(self, period: str) -> PerformanceReport:
+    async def _generate_report(self, period: str, date_str: Optional[str] = None) -> PerformanceReport:
         """기간별 성과 리포트 생성"""
         report = PerformanceReport(period=period)
 
-        # 기본 통계 조회
-        stats = await self._db.fetch_trade_stats()
+        # 기본 통계 조회 — daily는 해당 KST 날짜의 거래만, weekly는 전체
+        if period == "daily" and date_str:
+            stats = await self._db.fetch_trade_stats_for_date(date_str)
+        else:
+            stats = await self._db.fetch_trade_stats()
         if not stats or stats.get("total", 0) == 0:
             report.suggestions.append("거래 데이터가 없습니다. 전략 실행 후 분석 가능합니다.")
             return report

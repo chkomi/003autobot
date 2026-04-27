@@ -18,6 +18,22 @@ aiosqlite==0.20.0
 pydantic==2.10.6
 pydantic-settings==2.7.1
 
+# Web API (plan v2 §3.2)
+fastapi>=0.115
+uvicorn[standard]>=0.32
+
+# Database — phase3 (plan v2 §3.4)
+sqlalchemy>=2.0
+asyncpg>=0.29          # PostgreSQL async 드라이버
+aiosqlite>=0.20        # SQLite async 드라이버 (개발/폴백)
+alembic>=1.13          # DB 마이그레이션
+
+# Cache — phase3
+redis>=5.0             # Redis async 클라이언트 (redis-py)
+
+# Job queue — phase4
+rq>=1.16               # Redis Queue (백테스트 비동기 잡)
+
 # Logging
 loguru==0.7.3
 
@@ -29,5 +45,12 @@ pytest-mock==3.14.0
 # Backtesting (Python 3.14에서 numba 의존성으로 설치 불가. 클라우드/Python 3.11 환경에서 사용)
 # backtesting==0.3.3
 
+# ML 백테스트 v1 (LightGBM 회귀 + Parquet 저장)
+# macOS는 별도로 `brew install libomp` 필요 (LightGBM 의존)
+lightgbm>=4.5
+pyarrow>=18
+tqdm>=4.66
+matplotlib>=3.9          # ml_report.py 자본 곡선/feature importance PNG 렌더링
+
 # Already installed (listed for completeness):
-# aiohttp, websockets, python-dotenv, fastapi, uvicorn, pydantic, requests, PyYAML, uvloop
+# aiohttp, websockets, python-dotenv, pydantic, requests, PyYAML, uvloop

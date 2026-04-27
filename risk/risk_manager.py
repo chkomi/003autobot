@@ -46,12 +46,14 @@ class RiskManager:
         trading_cfg: TradingConfig,
         risk_cfg: RiskConfig,
         db: DatabaseManager,
+        goal_tracker: Optional["GoalTracker"] = None,
     ):
         self._t = trading_cfg
         self._r = risk_cfg
         self._db = db
         self._sizer = PositionSizer(trading_cfg, risk_cfg)
         self._peak_equity: float = 0.0  # 인메모리 고점 추적
+        self._goal_tracker = goal_tracker  # None이면 목표 스케일링 비활성화
 
     async def pre_trade_check(
         self,
@@ -138,6 +140,14 @@ class RiskManager:
                 avg_win_r = abs(stats.get("avg_win_pct", 0.02) or 0.02)
                 avg_loss_r = abs(stats.get("avg_loss_pct", 0.01) or 0.01)
 
+            # 목표 달성률 기반 Kelly 스케일 팩터 (GoalTracker 연동)
+            goal_scale = 1.0
+            if self._goal_tracker is not None:
+                try:
+                    goal_scale = await self._goal_tracker.get_kelly_scale(balance)
+                except Exception as e:
+                    logger.warning(f"GoalTracker Kelly 스케일 조회 실패 (기본값 1.0 사용): {e}")
+
             pos_size = self._sizer.calculate(
                 symbol=signal.symbol,
                 balance_usdt=balance,
@@ -147,6 +157,7 @@ class RiskManager:
                 avg_win_ratio=avg_win_r,
                 avg_loss_ratio=avg_loss_r,
                 drawdown_pct=current_drawdown,
+                goal_kelly_scale=goal_scale,
             )
         except InsufficientBalanceError as e:
             return RiskCheckReport(
@@ -190,3 +201,13 @@ class RiskManager:
         if self._peak_equity == 0:
             self._peak_equity = await self._db.fetch_peak_equity()
         return max(self._peak_equity, current)
+
+    def reset_daily(self) -> None:
+        """KST 자정 일일 리셋 호출. DB는 날짜 키 기반이라 자동 초기화되며,
+        이 메서드는 인메모리 상태 초기화 및 로그를 담당한다.
+
+        호출 시점: bot_engine의 _risk_monitor_loop에서 KST 날짜 전환 감지 시.
+        """
+        logger.info("[RiskManager] 일일 리셋: KST 자정 기준 daily_loss 카운터 초기화")
+        # DB는 _today()가 KST 날짜를 반환하므로 새 날짜에 접근 시 자동으로 빈 레코드 사용.
+        # 추가 인메모리 상태가 생기면 여기서 초기화한다.

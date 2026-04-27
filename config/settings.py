@@ -67,6 +67,33 @@ class TradingConfig(BaseSettings):
         return self.to_okx_inst_id(self.symbol_list[0])
 
 
+class GoalConfig(BaseSettings):
+    """투자 목표 설정 (CAPR)"""
+    model_config = SettingsConfigDict(env_prefix="GOAL_", env_file=".env", extra="ignore")
+
+    initial_capital: float = Field(
+        default=1096.0, gt=0,
+        description="시작 자본금 (USDT) — CAGR 및 누적 수익률 계산 기준"
+    )
+    start_date: str = Field(
+        default="2026-04-24",
+        description="목표 시작일 (YYYY-MM-DD). 비어 있으면 첫 equity_snapshot 날짜를 사용"
+    )
+    monthly_target_pct: float = Field(
+        default=0.2144, gt=0, le=1.0,
+        description="월 목표 수익률 (0.2144 = 21.44%, 1년 10x 달성 기준: 10^(1/12)-1)"
+    )
+    annual_target_pct: float = Field(
+        default=9.0, gt=0, le=20.0,
+        description="연간 목표 수익률 (9.0 = 900%, 10x = $1,096 → $10,960)"
+    )
+    # 목표 달성 시 포지션 사이즈 보수화 (0.8 = 20% 축소)
+    goal_achieved_kelly_scale: float = Field(
+        default=0.8, gt=0, le=1.0,
+        description="월 목표 80% 이상 달성 시 적용할 Kelly 스케일 팩터"
+    )
+
+
 class RiskConfig(BaseSettings):
     """리스크 관리 설정"""
     model_config = SettingsConfigDict(env_prefix="RISK_", env_file=".env", extra="ignore")
@@ -108,6 +135,7 @@ class Settings(BaseSettings):
     okx: OKXConfig = Field(default_factory=OKXConfig)
     trading: TradingConfig = Field(default_factory=TradingConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
+    goal: GoalConfig = Field(default_factory=GoalConfig)
 
     @property
     def telegram_configured(self) -> bool:

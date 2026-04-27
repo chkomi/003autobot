@@ -118,6 +118,7 @@ def run_backtest_for_symbol(
         )
         report = bt.run(df_4h, df_1h, df_15m)
         trades = bt.get_trades()
+        debug_counts = bt.get_debug_counts()
 
         # 워크포워드 검증 실행 (YAML 설정 사용)
         wf_params = params.walk_forward
@@ -207,6 +208,7 @@ def run_backtest_for_symbol(
                 "1h": len(df_1h),
                 "15m": len(df_15m),
             },
+            "debug_counts": debug_counts,
         }
     except (KeyError, ValueError, ZeroDivisionError, TypeError) as e:
         return {
