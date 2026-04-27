@@ -1,7 +1,14 @@
 # Secrets - NEVER commit
 .env
+.env.local
+.env.*.local
+.env.production
+.env.staging
+.env.development
 *.pem
 *.key
+*.p12
+*.pfx
 
 # Generated data
 logs/
@@ -31,6 +38,13 @@ __pycache__/
 # Backtest outputs
 backtest/results/
 report/
+
+# ML artifacts (generated, large)
+features/
+models/
+*.parquet
+*.lgb
+*.tsbuildinfo
 
 # Virtual environment
 .venv/
